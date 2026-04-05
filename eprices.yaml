@@ -1,0 +1,2097 @@
+# =============================================================================
+# ESPHome: EPrices v1.0
+#
+# ESP32 firmware that fetches day-ahead electricity spot prices from the
+# public Energy-Charts API (https://api.energy-charts.info) and exposes
+# them as Home Assistant sensors. No API token required.
+#
+# Electricity price data provided by Energy-Charts (https://energy-charts.info)
+# under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).
+#
+# v1.0 release notes:
+# - Fetches 15-min and hourly spot prices for today and tomorrow
+# - Prices converted from raw €/MWh to €/kWh with provider fee and VAT applied
+# - NVS persistence: prices survive reboots without re-fetching
+# - Midnight bridge: tomorrow's data promoted to today at 00:00 — fully on-device
+# - Auto-retry: up to 8 HTTP fetch attempts for today and tomorrow
+# - DST-safe: UNIX timestamp binary search throughout (no hour-slot arithmetic)
+# - Staleness detection: Today Current Price Status shows "Stale" on date mismatch
+# - Tomorrow live sensors evaluate at now + 86400s (same local time tomorrow)
+# - Tomorrow Data Loaded Time shows "Outside fetch window" before 13:20
+# - API fetch times reset to "Never" at midnight and on clear_tomorrow_prices
+# - API fetch attempt counters reset to 0 at midnight; publish 0 on boot
+# - Negative prices formatted as %.3f to stay within 255-char HA state limit
+# - Uptime displayed as human-readable string (s / min / h min / d h / months d)
+# - WiFi signal strength and uptime exposed as diagnostic sensors
+# - All core logic on-device: no external HA automations required
+#
+# secrets.yaml keys required:
+#   wifi_ssid, wifi_password
+#   eprices_fallback_ap_ssid, eprices_fallback_ap_password
+#   eprices_api_encryption_key    (base64, generate: openssl rand -base64 32)
+#   eprices_timezone              e.g. "Europe/Ljubljana"
+#   eprices_country_bzn           e.g. "SI"
+#   eprices_prov_fee              e.g. "0.12"  (provider fee, decimal multiplier)
+#   eprices_vat_rate              e.g. "0.22"  (VAT rate, decimal multiplier)
+#
+# See README.md for full installation instructions and sensor reference.
+# See CHANGELOG.md for complete sensor and entity ID listing.
+# See ENTSO-E-PRICES-MIGRATION.md if migrating from entso-e-prices v4.3.1.
+# =============================================================================
+
+substitutions:
+  country_bzn_value: !secret eprices_country_bzn
+  prov_fee_value:    !secret eprices_prov_fee
+  vat_rate_value:    !secret eprices_vat_rate
+
+esphome:
+  name: eprices
+  friendly_name: EPrices
+  includes:
+    - eprices_nvs.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(today_nvs_status).publish_state("Unknown");
+          id(tomorrow_nvs_status).publish_state("Unknown");
+          if (id(ha_time).now().is_valid()) {
+            id(boot_time) = id(ha_time).now().timestamp;
+          } else {
+            id(boot_time) = 0;
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    # No include_builtin_idf_components needed — nvs headers are always
+    # available in esp-idf framework; eprices_nvs.h includes them directly.
+
+captive_portal:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: !secret eprices_fallback_ap_ssid
+    password: !secret eprices_fallback_ap_password
+
+logger:
+  level: INFO
+
+ota:
+  - platform: esphome
+
+# =============================================================================
+# HTTP REQUEST
+# =============================================================================
+http_request:
+  useragent: esphome/eprices
+  timeout: 25s
+  verify_ssl: true
+
+# =============================================================================
+# API
+# =============================================================================
+api:
+  encryption:
+    key: !secret eprices_api_encryption_key
+  actions:
+    - action: verify_price_update
+      supports_response: only
+      then:
+        - api.respond:
+            data: !lambda |-
+              root["price_updated"]   = (id(avg_price).state > 0.0);
+              root["current_price"]   = id(current_price).state;
+              root["avg_price"]       = id(avg_price).state;
+              root["price_count"]     = id(today_entry_count);
+              root["timestamp"]       = id(ha_time).now().timestamp;
+              root["update_status"]   = id(last_update_success);
+              root["retry_count"]     = id(retry_count);
+              root["status_message"]  = id(update_status_message);
+
+    - action: promote_and_load_today_from_nvs
+      then:
+        - script.execute: midnight_bridge_promotion
+
+    - action: load_today_from_nvs
+      then:
+        - script.execute: nvs_load_today_script
+        - lambda: |-
+            if (id(today_entry_count) > 0) {
+              id(recompute_today).execute();
+              id(last_update_success) = true;
+              id(update_status_message) = "Loaded from NVS (API)";
+              id(last_update_source).publish_state("NVS_api");
+              id(today_price_update_status).update();
+              id(today_price_status_message).update();
+              id(today_current_price_status).update();
+            }
+
+    - action: clear_today_prices
+      then:
+        - script.execute: clear_today_prices
+
+    - action: clear_tomorrow_prices
+      then:
+        - script.execute: clear_tomorrow_prices
+
+# =============================================================================
+# TIME
+# =============================================================================
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: !secret eprices_timezone
+    on_time:
+      - minutes: /15
+        seconds: 2
+        then:
+          - component.update: current_price
+          - component.update: today_next_price
+          - component.update: today_current_hourly_price
+          - component.update: today_next_hourly_price
+          - component.update: today_current_max_hourly_price_percentage
+
+      - minutes: /15
+        seconds: 3
+        then:
+          - component.update: tomorrow_current_price
+          - component.update: tomorrow_next_price
+          - component.update: tomorrow_current_hourly_price
+          - component.update: tomorrow_next_hourly_price
+          - component.update: tomorrow_current_max_hourly_price_percentage
+
+      - seconds: 45
+        then:
+          - script.execute: boot_recovery_today_script
+
+      - seconds: 50
+        then:
+          - script.execute: boot_recovery_tomorrow_script
+
+      - seconds: /10
+        then:
+          - lambda: |-
+              if (id(need_today_update) && !id(is_updating_today)) {
+                ESP_LOGI("eprices", "Worker: starting Today update");
+                id(need_today_update) = false;
+                id(smart_price_update).execute();
+              }
+
+      - seconds: /10
+        then:
+          - lambda: |-
+              auto t = id(ha_time).now();
+              bool in_window = (t.hour > 13 && t.hour < 23) ||
+                               (t.hour == 13 && t.minute >= 20) ||
+                               (t.hour == 23 && t.minute <= 50);
+              if (id(need_tomorrow_update) && !id(is_updating_tomorrow) && in_window) {
+                ESP_LOGI("eprices", "Worker: starting Tomorrow update");
+                id(need_tomorrow_update) = false;
+                id(smart_tomorrow_price_update).execute();
+              }
+
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - logger.log: "Midnight: promoting tomorrow -> today"
+          - script.execute: midnight_bridge_promotion
+
+      # =============================================================================
+      # AUTO TODAY FETCH RETRIES (boot NVS-miss + midnight fallback)
+      #
+      # Only active when auto_today_retry_active == true.
+      # Max attempts: 8 (counted in after_today_fetch failure handling).
+      # This does not affect manual button presses.
+      # =============================================================================
+
+      # 00:05 quick retry
+      - seconds: 5
+        minutes: 5
+        hours: 0
+        then:
+          - lambda: |-
+              if (!id(auto_today_retry_active)) return;
+              if (id(last_update_success)) return;
+              if (id(is_updating_today)) return;
+              if (id(auto_today_retry_count) >= 8) return;
+              ESP_LOGW("eprices", "Auto today: retry trigger 00:05 (attempt %d)", id(auto_today_retry_count) + 1);
+              id(need_today_update) = true;
+
+      # 00:15 quick retry
+      - seconds: 5
+        minutes: 15
+        hours: 0
+        then:
+          - lambda: |-
+              if (!id(auto_today_retry_active)) return;
+              if (id(last_update_success)) return;
+              if (id(is_updating_today)) return;
+              if (id(auto_today_retry_count) >= 8) return;
+              ESP_LOGW("eprices", "Auto today: retry trigger 00:15 (attempt %d)", id(auto_today_retry_count) + 1);
+              id(need_today_update) = true;
+
+      # 00:30 quick retry
+      - seconds: 5
+        minutes: 30
+        hours: 0
+        then:
+          - lambda: |-
+              if (!id(auto_today_retry_active)) return;
+              if (id(last_update_success)) return;
+              if (id(is_updating_today)) return;
+              if (id(auto_today_retry_count) >= 8) return;
+              ESP_LOGW("eprices", "Auto today: retry trigger 00:30 (attempt %d)", id(auto_today_retry_count) + 1);
+              id(need_today_update) = true;
+
+      # Hourly retries at :30 (01:30..23:30)
+      - seconds: 5
+        minutes: 30
+        hours: /1
+        then:
+          - lambda: |-
+              auto t = id(ha_time).now();
+              if (!id(auto_today_retry_active)) return;
+              if (t.hour == 0) return;  // handled above
+              if (id(last_update_success)) return;
+              if (id(is_updating_today)) return;
+              if (id(auto_today_retry_count) >= 8) return;
+              ESP_LOGW("eprices", "Auto today: hourly retry trigger %02d:30 (attempt %d)", t.hour, id(auto_today_retry_count) + 1);
+              id(need_today_update) = true;
+
+      # =============================================================================
+      # AUTO TOMORROW FETCH SCHEDULER
+      #
+      # Attempts (8 total):
+      #  1) 13:25
+      #  2) 13:55
+      #  3) 14:55
+      #  4) 15:55
+      #  5) 16:55
+      #  6) 17:55
+      #  7) 18:55
+      #  8) 19:55
+      #
+      # Stops after success, stops if an update is already running, and caps at 8.
+      # =============================================================================
+
+      # Attempt #1 at 13:25
+      - seconds: 5
+        minutes: 25
+        hours: 13
+        then:
+          - lambda: |-
+              if (id(tomorrow_last_update_success)) {
+                ESP_LOGI("eprices", "Auto tomorrow: already successful today, skipping 13:25");
+                return;
+              }
+              if (id(is_updating_tomorrow)) {
+                ESP_LOGI("eprices", "Auto tomorrow: already running at 13:25, skipping");
+                return;
+              }
+              // Reset counter for today's auto schedule
+              id(tomorrow_retry_count) = 0;
+              ESP_LOGI("eprices", "Auto tomorrow: attempt #1 at 13:25");
+              id(smart_tomorrow_price_update).execute();
+
+      # Attempt #2 at 13:55
+      - seconds: 5
+        minutes: 55
+        hours: 13
+        then:
+          - lambda: |-
+              if (id(tomorrow_last_update_success)) return;
+              if (id(is_updating_tomorrow)) return;
+
+              if (id(tomorrow_retry_count) >= 8) {
+                ESP_LOGW("eprices", "Auto tomorrow: max attempts reached (%d), stop retrying", id(tomorrow_retry_count));
+                return;
+              }
+
+              ESP_LOGW("eprices", "Auto tomorrow: attempt #%d at 13:55", id(tomorrow_retry_count) + 1);
+              id(smart_tomorrow_price_update).execute();
+
+      # Attempts #3.. at 14:55, 15:55, 16:55, 17:55, 18:55, 19:55 (capped to 8)
+      - seconds: 5
+        minutes: 55
+        hours: /1
+        then:
+          - lambda: |-
+              auto t = id(ha_time).now();
+              // Only run hourly retries between 14:00 and 19:59
+              if (t.hour < 14 || t.hour > 19) return;
+
+              if (id(tomorrow_last_update_success)) return;
+              if (id(is_updating_tomorrow)) return;
+
+              if (id(tomorrow_retry_count) >= 8) {
+                ESP_LOGW("eprices", "Auto tomorrow: max attempts reached (%d), stop retrying", id(tomorrow_retry_count));
+                return;
+              }
+
+              ESP_LOGW("eprices", "Auto tomorrow: attempt #%d at %02d:55", id(tomorrow_retry_count) + 1, t.hour);
+              id(smart_tomorrow_price_update).execute();
+
+      - minutes: /1
+        seconds: 10
+        then:
+          - lambda: |-
+              if (id(boot_time) == 0 && id(ha_time).now().is_valid()) {
+                id(boot_time) = id(ha_time).now().timestamp;
+                ESP_LOGI("eprices", "boot_time set: %d", (int)id(boot_time));
+              }
+
+# =============================================================================
+# GLOBALS
+# =============================================================================
+globals:
+  # --- DST-safe arrays (today) ---
+  - id: price_timestamps_today
+    type: std::vector<int64_t>
+    initial_value: 'std::vector<int64_t>()'
+  - id: price_values_today
+    type: std::vector<float>
+    initial_value: 'std::vector<float>()'
+  - id: today_entry_count
+    type: int
+    initial_value: '0'
+  - id: today_date_str
+    type: std::string
+    initial_value: '"00000000"'
+
+  # --- DST-safe arrays (tomorrow) ---
+  - id: price_timestamps_tomorrow
+    type: std::vector<int64_t>
+    initial_value: 'std::vector<int64_t>()'
+  - id: price_values_tomorrow
+    type: std::vector<float>
+    initial_value: 'std::vector<float>()'
+  - id: tomorrow_entry_count
+    type: int
+    initial_value: '0'
+  - id: tomorrow_date_str
+    type: std::string
+    initial_value: '"00000000"'
+
+  # --- Legacy 96/24-slot vectors (for JSON text sensors) ---
+  - id: hourly_prices
+    type: std::vector<float>
+    initial_value: 'std::vector<float>(96, 0.0f)'
+  - id: hourly_avg_prices_kwh
+    type: std::vector<float>
+    initial_value: 'std::vector<float>(24, 0.0f)'
+  - id: tomorrow_hourly_prices
+    type: std::vector<float>
+    initial_value: 'std::vector<float>(96, 0.0f)'
+  - id: tomorrow_hourly_avg_prices_kwh
+    type: std::vector<float>
+    initial_value: 'std::vector<float>(24, 0.0f)'
+
+  # --- Time strings ---
+  - id: min_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+  - id: max_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+  - id: min_hourly_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+  - id: max_hourly_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+  - id: tomorrow_min_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+  - id: tomorrow_max_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+  - id: tomorrow_min_hourly_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+  - id: tomorrow_max_hourly_price_time_str
+    type: std::string
+    initial_value: '"--:--"'
+
+  # --- State / bookkeeping ---
+  - id: boot_time
+    type: time_t
+    initial_value: '0'
+  - id: last_successful_update
+    type: time_t
+    initial_value: '0'
+  - id: today_last_api_fetch_time
+    type: std::string
+    restore_value: false
+    initial_value: '"Never"'
+  - id: last_update_attempt
+    type: time_t
+    initial_value: '0'
+  - id: last_update_success
+    type: bool
+    initial_value: 'false'
+  - id: update_status_message
+    type: std::string
+    initial_value: '"System Boot"'
+  - id: retry_count
+    type: int
+    initial_value: '0'
+  - id: boot_recovery_executed
+    type: bool
+    initial_value: 'false'
+  - id: current_price_status_str
+    type: std::string
+    initial_value: '"Initializing..."'
+  - id: need_today_update
+    type: bool
+    initial_value: 'false'
+  - id: is_updating_today
+    type: bool
+    initial_value: 'false'
+
+  - id: tomorrow_last_successful_update
+    type: time_t
+    initial_value: '0'
+  - id: tomorrow_last_api_fetch_time
+    type: std::string
+    restore_value: false
+    initial_value: '"Never"'
+  - id: tomorrow_last_update_attempt
+    type: time_t
+    initial_value: '0'
+  - id: tomorrow_last_update_success
+    type: bool
+    initial_value: 'false'
+  - id: tomorrow_update_status_message
+    type: std::string
+    initial_value: '"Waiting for 13:20"'
+  - id: tomorrow_retry_count
+    type: int
+    initial_value: '0'
+  - id: tomorrow_boot_recovery_executed
+    type: bool
+    initial_value: 'false'
+  - id: tomorrow_current_price_status_str
+    type: std::string
+    initial_value: '"Waiting..."'
+  - id: need_tomorrow_update
+    type: bool
+    initial_value: 'false'
+  - id: is_updating_tomorrow
+    type: bool
+    initial_value: 'false'
+
+  # --- Country code for Energy-Charts API (wired from secret) ---
+  - id: country_bzn
+    type: std::string
+    initial_value: '"${country_bzn_value}"'
+
+  # --- Provider fee and VAT rate (wired from secrets via substitutions) ---
+  - id: prov_fee
+    type: double
+    initial_value: '${prov_fee_value}'
+  - id: vat_rate
+    type: double
+    initial_value: '${vat_rate_value}'
+
+  # --- Pre-computed fetch URLs (url: !lambda not supported in scripts) ---
+  - id: fetch_url_today
+    type: std::string
+    initial_value: '""'
+  - id: fetch_url_tomorrow
+    type: std::string
+    initial_value: '""'
+
+  # --- Auto-retry mode for TODAY (boot/midnight only; manual stays one-shot) ---
+  - id: auto_today_retry_active
+    type: bool
+    initial_value: 'false'
+
+  - id: auto_today_retry_count
+    type: int
+    initial_value: '0'
+
+# =============================================================================
+# SENSORS – TODAY
+# =============================================================================
+sensor:
+  - platform: template
+    name: "Today Current Price"
+    id: current_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:currency-eur"
+    lambda: |-
+      if (id(today_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp;
+      int idx = -1;
+      for (int j = id(today_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_today)[j] <= ts) { idx = j; break; }
+      return (idx >= 0) ? id(price_values_today)[idx] : NAN;
+
+  - platform: template
+    name: "Today Next Price"
+    id: today_next_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-right-circle"
+    lambda: |-
+      if (id(today_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp;
+      int idx = -1;
+      for (int j = id(today_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_today)[j] <= ts) { idx = j + 1; break; }
+      return (idx >= 0 && idx < id(today_entry_count)) ? id(price_values_today)[idx] : NAN;
+
+  - platform: template
+    name: "Today Average Price"
+    id: avg_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:chart-bell-curve"
+
+  - platform: template
+    name: "Today Highest Price"
+    id: max_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-up-bold"
+
+  - platform: template
+    name: "Today Lowest Price"
+    id: min_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-down-bold"
+
+  - platform: template
+    name: "Today Current Hourly Price"
+    id: today_current_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:chart-line"
+    lambda: |-
+      if (id(today_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp;
+      int idx = -1;
+      for (int j = id(today_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_today)[j] <= ts) { idx = j; break; }
+      if (idx < 0) return NAN;
+      time_t t = (time_t)id(price_timestamps_today)[idx];
+      struct tm *tmi = localtime(&t);
+      if (!tmi) return NAN;
+      int h = tmi->tm_hour;
+      return (h >= 0 && h < (int)id(hourly_avg_prices_kwh).size()) ? id(hourly_avg_prices_kwh)[h] : NAN;
+
+  - platform: template
+    name: "Today Next Hourly Price"
+    id: today_next_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-right-circle-outline"
+    lambda: |-
+      if (id(today_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp;
+      int idx = -1;
+      for (int j = id(today_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_today)[j] <= ts) { idx = j; break; }
+      if (idx < 0) return NAN;
+      time_t t = (time_t)id(price_timestamps_today)[idx];
+      struct tm *tmi = localtime(&t);
+      if (!tmi) return NAN;
+      int h = tmi->tm_hour + 1;
+      return (h >= 0 && h < (int)id(hourly_avg_prices_kwh).size()) ? id(hourly_avg_prices_kwh)[h] : NAN;
+
+  - platform: template
+    name: "Today Highest Hourly Price"
+    id: max_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-up-bold-box"
+
+  - platform: template
+    name: "Today Lowest Hourly Price"
+    id: min_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-down-bold-box"
+
+  - platform: template
+    name: "Today Current Max Hourly Price Percentage"
+    id: today_current_max_hourly_price_percentage
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:percent"
+    lambda: |-
+      float cp = id(today_current_hourly_price).state;
+      float mp = id(max_hourly_price).state;
+      if (std::isnan(cp) || std::isnan(mp) || mp <= 0.0f) return NAN;
+      return (cp / mp) * 100.0f;
+
+# =============================================================================
+# SENSORS – TOMORROW
+# =============================================================================
+  - platform: template
+    name: "Tomorrow Current Price"
+    id: tomorrow_current_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:currency-eur"
+    lambda: |-
+      if (id(tomorrow_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp + 86400;
+      int idx = -1;
+      for (int j = id(tomorrow_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_tomorrow)[j] <= ts) { idx = j; break; }
+      return (idx >= 0) ? id(price_values_tomorrow)[idx] : NAN;
+
+  - platform: template
+    name: "Tomorrow Next Price"
+    id: tomorrow_next_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-right-circle"
+    lambda: |-
+      if (id(tomorrow_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp + 86400;
+      int idx = -1;
+      for (int j = id(tomorrow_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_tomorrow)[j] <= ts) { idx = j + 1; break; }
+      return (idx >= 0 && idx < id(tomorrow_entry_count)) ? id(price_values_tomorrow)[idx] : NAN;
+
+  - platform: template
+    name: "Tomorrow Average Price"
+    id: tomorrow_avg_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:chart-bell-curve"
+
+  - platform: template
+    name: "Tomorrow Highest Price"
+    id: tomorrow_max_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-up-bold"
+
+  - platform: template
+    name: "Tomorrow Lowest Price"
+    id: tomorrow_min_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-down-bold"
+
+  - platform: template
+    name: "Tomorrow Current Hourly Price"
+    id: tomorrow_current_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:chart-line"
+    lambda: |-
+      if (id(tomorrow_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp + 86400;
+      int idx = -1;
+      for (int j = id(tomorrow_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_tomorrow)[j] <= ts) { idx = j; break; }
+      if (idx < 0) return NAN;
+      time_t t = (time_t)id(price_timestamps_tomorrow)[idx];
+      struct tm *tmi = localtime(&t);
+      if (!tmi) return NAN;
+      int h = tmi->tm_hour;
+      return (h >= 0 && h < (int)id(tomorrow_hourly_avg_prices_kwh).size()) ? id(tomorrow_hourly_avg_prices_kwh)[h] : NAN;
+
+  - platform: template
+    name: "Tomorrow Next Hourly Price"
+    id: tomorrow_next_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-right-circle-outline"
+    lambda: |-
+      if (id(tomorrow_entry_count) == 0) return NAN;
+      int64_t ts = (int64_t)id(ha_time).now().timestamp + 86400;
+      int idx = -1;
+      for (int j = id(tomorrow_entry_count) - 1; j >= 0; --j)
+        if (id(price_timestamps_tomorrow)[j] <= ts) { idx = j; break; }
+      if (idx < 0) return NAN;
+      time_t t = (time_t)id(price_timestamps_tomorrow)[idx];
+      struct tm *tmi = localtime(&t);
+      if (!tmi) return NAN;
+      int h = tmi->tm_hour + 1;
+      return (h >= 0 && h < (int)id(tomorrow_hourly_avg_prices_kwh).size()) ? id(tomorrow_hourly_avg_prices_kwh)[h] : NAN;
+
+  - platform: template
+    name: "Tomorrow Highest Hourly Price"
+    id: tomorrow_max_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-up-bold-box"
+
+  - platform: template
+    name: "Tomorrow Lowest Hourly Price"
+    id: tomorrow_min_hourly_price
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:arrow-down-bold-box"
+
+  - platform: template
+    name: "Tomorrow Current Max Hourly Price Percentage"
+    id: tomorrow_current_max_hourly_price_percentage
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:percent"
+    lambda: |-
+      float cp = id(tomorrow_current_hourly_price).state;
+      float mp = id(tomorrow_max_hourly_price).state;
+      if (std::isnan(cp) || std::isnan(mp) || mp <= 0.0f) return NAN;
+      return (cp / mp) * 100.0f;
+
+# =============================================================================
+# SENSORS – SYSTEM DIAGNOSTIC
+# =============================================================================
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_sensor
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    internal: true
+    update_interval: 60s
+    entity_category: "diagnostic"
+    on_raw_value:
+      then:
+        - lambda: |-
+            uint32_t s = (uint32_t)x;
+            char buf[32];
+            if (s < 120) {
+              snprintf(buf, sizeof(buf), "%u s", s);
+            } else if (s < 48 * 3600) {
+              uint32_t h = s / 3600;
+              uint32_t m = (s % 3600) / 60;
+              if (h < 2)
+                snprintf(buf, sizeof(buf), "%u min", s / 60);
+              else
+                snprintf(buf, sizeof(buf), "%u h %u min", h, m);
+            } else if (s < 90UL * 86400UL) {
+              uint32_t d = s / 86400;
+              uint32_t h = (s % 86400) / 3600;
+              snprintf(buf, sizeof(buf), "%u d %u h", d, h);
+            } else {
+              uint32_t d   = s / 86400;
+              uint32_t mo  = d / 30;
+              uint32_t rem = d % 30;
+              snprintf(buf, sizeof(buf), "%u months %u d", mo, rem);
+            }
+            id(uptime_text).publish_state(buf);
+
+# =============================================================================
+# TEXT SENSORS – TODAY
+# =============================================================================
+text_sensor:
+  - platform: template
+    name: "Today JSON Hourly Prices EUR⁄kWh"
+    id: json_hourly_prices_kwh
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Today JSON 15-Min Prices EUR⁄kWh (P1 00:00-07:45)"
+    id: json_15min_prices_kwh_p1_00_00_07_45
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Today JSON 15-Min Prices EUR⁄kWh (P2 08:00-15:45)"
+    id: json_15min_prices_kwh_p2_08_00_15_45
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Today JSON 15-Min Prices EUR⁄kWh (P3 16:00-23:45)"
+    id: json_15min_prices_kwh_p3_16_00_23_45
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Today Highest Price Time"
+    id: max_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(max_price_time_str);"
+
+  - platform: template
+    name: "Today Lowest Price Time"
+    id: min_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(min_price_time_str);"
+
+  - platform: template
+    name: "Today Highest Hourly Price Time"
+    id: max_hourly_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(max_hourly_price_time_str);"
+
+  - platform: template
+    name: "Today Lowest Hourly Price Time"
+    id: min_hourly_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(min_hourly_price_time_str);"
+
+  - platform: template
+    name: "Today Price Update Status"
+    id: today_price_update_status
+    icon: "mdi:update"
+    entity_category: "diagnostic"
+    lambda: |-
+      return id(last_update_success) ? std::string("SUCCESS") : std::string("FAILED/WAITING");
+
+  - platform: template
+    name: "Today Data Loaded Time"
+    id: today_last_price_update_time
+    icon: "mdi:clock-outline"
+    lambda: |-
+      time_t lu = id(last_successful_update);
+      if (lu > 0) {
+        struct tm *tmi = localtime(&lu);
+        char buf[20];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tmi);
+        return std::string(buf);
+      }
+      return std::string("Never");
+
+  - platform: template
+    name: "Today Price Update Status Message"
+    id: today_price_status_message
+    icon: "mdi:message-text-outline"
+    entity_category: "diagnostic"
+    lambda: "return id(update_status_message);"
+
+  - platform: template
+    name: "Today Current Price Status"
+    id: today_current_price_status
+    icon: "mdi:information-outline"
+    lambda: "return id(current_price_status_str);"
+
+  - platform: template
+    name: "Today Entry Count"
+    id: today_entry_count_sensor
+    icon: "mdi:counter"
+    entity_category: "diagnostic"
+    update_interval: 60s
+    lambda: |-
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", id(today_entry_count));
+      return std::string(buf);
+
+# =============================================================================
+# TEXT SENSORS – TOMORROW
+# =============================================================================
+  - platform: template
+    name: "Tomorrow JSON Hourly Prices EUR⁄kWh"
+    id: json_tomorrow_hourly_prices_kwh
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Tomorrow JSON 15-Min Prices EUR⁄kWh (P1 00:00-07:45)"
+    id: json_tomorrow_15min_prices_kwh_p1_00_00_07_45
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Tomorrow JSON 15-Min Prices EUR⁄kWh (P2 08:00-15:45)"
+    id: json_tomorrow_15min_prices_kwh_p2_08_00_15_45
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Tomorrow JSON 15-Min Prices EUR⁄kWh (P3 16:00-23:45)"
+    id: json_tomorrow_15min_prices_kwh_p3_16_00_23_45
+    icon: "mdi:code-json"
+    update_interval: never
+
+  - platform: template
+    name: "Tomorrow Highest Price Time"
+    id: tomorrow_max_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(tomorrow_max_price_time_str);"
+
+  - platform: template
+    name: "Tomorrow Lowest Price Time"
+    id: tomorrow_min_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(tomorrow_min_price_time_str);"
+
+  - platform: template
+    name: "Tomorrow Highest Hourly Price Time"
+    id: tomorrow_max_hourly_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(tomorrow_max_hourly_price_time_str);"
+
+  - platform: template
+    name: "Tomorrow Lowest Hourly Price Time"
+    id: tomorrow_min_hourly_price_time
+    icon: "mdi:clock-time-three"
+    lambda: "return id(tomorrow_min_hourly_price_time_str);"
+
+  - platform: template
+    name: "Tomorrow Price Update Status"
+    id: tomorrow_price_update_status
+    icon: "mdi:update"
+    entity_category: "diagnostic"
+    lambda: |-
+      return id(tomorrow_last_update_success) ? std::string("SUCCESS") : std::string("FAILED/WAITING");
+
+  - platform: template
+    name: "Tomorrow Data Loaded Time"
+    id: tomorrow_last_price_update_time
+    icon: "mdi:clock-outline"
+    lambda: |-
+      time_t lu = id(tomorrow_last_update_attempt);
+      if (lu > 0) {
+        struct tm *tmi = localtime(&lu);
+        char buf[20];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tmi);
+        return std::string(buf);
+      }
+      return std::string("Never");
+
+  - platform: template
+    name: "Tomorrow Price Update Status Message"
+    id: tomorrow_price_status_message
+    icon: "mdi:message-text-outline"
+    entity_category: "diagnostic"
+    lambda: "return id(tomorrow_update_status_message);"
+
+  - platform: template
+    name: "Tomorrow Current Price Status"
+    id: tomorrow_current_price_status
+    icon: "mdi:information-outline"
+    lambda: "return id(tomorrow_current_price_status_str);"
+
+  - platform: template
+    name: "Tomorrow Entry Count"
+    id: tomorrow_entry_count_sensor
+    icon: "mdi:counter"
+    entity_category: "diagnostic"
+    update_interval: 60s
+    lambda: |-
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", id(tomorrow_entry_count));
+      return std::string(buf);
+
+# =============================================================================
+# TEXT SENSORS – DIAGNOSTIC
+# =============================================================================
+  - platform: template
+    name: "Last Reboot"
+    id: last_reboot
+    icon: "mdi:clock-start"
+    entity_category: "diagnostic"
+    lambda: |-
+      time_t bt = id(boot_time);
+      if (bt > 0) {
+        struct tm *tmi = localtime(&bt);
+        char buf[20];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tmi);
+        return std::string(buf);
+      }
+      return std::string("Unknown");
+
+  - platform: template
+    name: "Today NVS Status"
+    id: today_nvs_status
+    icon: "mdi:database-check"
+    entity_category: "diagnostic"
+    update_interval: never
+
+  - platform: template
+    name: "Tomorrow NVS Status"
+    id: tomorrow_nvs_status
+    icon: "mdi:database-check"
+    entity_category: "diagnostic"
+    update_interval: never
+
+  - platform: template
+    name: "Last Update Source"
+    id: last_update_source
+    icon: "mdi:information"
+    entity_category: "diagnostic"
+
+  - platform: template
+    name: "Today Data Date"
+    id: today_data_date_sensor
+    icon: "mdi:calendar-today"
+    entity_category: "diagnostic"
+    lambda: |-
+      const std::string &s = id(today_date_str);
+      if (s.size() != 8 || s == "00000000") return std::string("Unknown");
+      return s.substr(0,4) + "-" + s.substr(4,2) + "-" + s.substr(6,2);
+
+  - platform: template
+    name: "Tomorrow Data Date"
+    id: tomorrow_data_date_sensor
+    icon: "mdi:calendar-arrow-right"
+    entity_category: "diagnostic"
+    lambda: |-
+      const std::string &s = id(tomorrow_date_str);
+      if (s.size() != 8 || s == "00000000") return std::string("Unknown");
+      return s.substr(0,4) + "-" + s.substr(4,2) + "-" + s.substr(6,2);
+
+  - platform: template
+    name: "Today Last API Fetch Time"
+    id: today_last_api_fetch_time_sensor
+    icon: "mdi:clock-out"
+    entity_category: "diagnostic"
+    update_interval: never
+    lambda: "return id(today_last_api_fetch_time);"
+
+  - platform: template
+    name: "Tomorrow Last API Fetch Time"
+    id: tomorrow_last_api_fetch_time_sensor
+    icon: "mdi:clock-out"
+    entity_category: "diagnostic"
+    update_interval: never
+    lambda: "return id(tomorrow_last_api_fetch_time);"
+
+  - platform: template
+    name: "Today API Fetch Attempts"
+    id: today_price_update_attempts
+    icon: "mdi:counter"
+    entity_category: "diagnostic"
+    update_interval: never
+    lambda: |-
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", id(retry_count));
+      return std::string(buf);
+
+  - platform: template
+    name: "Tomorrow API Fetch Attempts"
+    id: tomorrow_price_update_attempts
+    icon: "mdi:counter"
+    entity_category: "diagnostic"
+    update_interval: never
+    lambda: |-
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", id(tomorrow_retry_count));
+      return std::string(buf);
+
+  - platform: template
+    name: "Uptime"
+    id: uptime_text
+    icon: "mdi:timer-outline"
+    entity_category: "diagnostic"
+    update_interval: never
+
+# =============================================================================
+# BUTTONS
+# =============================================================================
+button:
+  - platform: template
+    name: "Force Today's Update"
+    id: force_update_button
+    icon: "mdi:refresh"
+    on_press:
+      then:
+        - logger.log: "Manual Today update triggered"
+        - lambda: |-
+            id(update_status_message) = "Updating...";
+            id(today_price_status_message).publish_state("Updating...");
+        - script.execute: smart_price_update
+
+  - platform: template
+    name: "Force Tomorrow's Update"
+    id: force_tomorrow_update_button
+    icon: "mdi:calendar-refresh"
+    on_press:
+      then:
+        - lambda: |-
+            auto t = id(ha_time).now();
+            bool in_window = (t.hour > 13 && t.hour < 23) ||
+                             (t.hour == 13 && t.minute >= 20) ||
+                             (t.hour == 23 && t.minute <= 50);
+            if (in_window) {
+              ESP_LOGI("eprices", "Manual Tomorrow update triggered");
+              id(tomorrow_update_status_message) = "Updating...";
+              id(tomorrow_price_status_message).publish_state("Updating...");
+              id(smart_tomorrow_price_update).execute();  // one-shot
+            } else {
+              ESP_LOGI("eprices", "Tomorrow update ignored – window is 13:20-23:50");
+            }
+
+  - platform: template
+    name: "Reboot Device"
+    id: reboot_button
+    icon: "mdi:power-cycle"
+    on_press:
+      then:
+        - logger.log: "Manual reboot requested"
+        - lambda: "esp_restart();"
+
+# =============================================================================
+# SCRIPTS
+# =============================================================================
+script:
+  # ---------------------------------------------------------------------------
+  # NVS SAVE / LOAD
+  # ---------------------------------------------------------------------------
+  - id: nvs_save_today_script
+    then:
+      - lambda: |-
+          bool ok = eprices_nvs::save_today(
+            id(today_entry_count), id(today_date_str),
+            id(price_values_today), id(price_timestamps_today));
+
+          auto fmt = [](const std::string &s) -> std::string {
+            if (s.size() != 8 || s == "00000000") return std::string("Unknown");
+            return s.substr(0,4) + "-" + s.substr(4,2) + "-" + s.substr(6,2);
+          };
+
+          char buf[80];
+          if (ok) snprintf(buf, sizeof(buf), "Stored %d pts for %s",
+                           id(today_entry_count), fmt(id(today_date_str)).c_str());
+          else    snprintf(buf, sizeof(buf), "Store FAILED");
+          id(today_nvs_status).publish_state(buf);
+
+  - id: nvs_load_today_script
+    then:
+      - lambda: |-
+          auto now = id(ha_time).now();
+          char today_buf[9];
+          snprintf(today_buf, sizeof(today_buf), "%04d%02d%02d",
+                   now.year, now.month, now.day_of_month);
+          std::string expected(today_buf);
+
+          std::vector<float>   pv;
+          std::vector<int64_t> ts;
+          int cnt = 0;
+          bool ok = eprices_nvs::load_today(expected, pv, ts, cnt);
+          if (ok) {
+            id(price_values_today)     = pv;
+            id(price_timestamps_today) = ts;
+            id(today_entry_count)      = cnt;
+            id(today_date_str)         = expected;
+
+            auto fmt = [](const std::string &s) -> std::string {
+              if (s.size() != 8 || s == "00000000") return std::string("Unknown");
+              return s.substr(0,4) + "-" + s.substr(4,2) + "-" + s.substr(6,2);
+            };
+
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Loaded %d pts for %s", cnt, fmt(expected).c_str());
+            id(today_nvs_status).publish_state(buf);
+          } else {
+            id(today_entry_count) = 0;
+            id(today_nvs_status).publish_state("Load FAILED / stale");
+          }
+
+  - id: nvs_save_tomorrow_script
+    then:
+      - lambda: |-
+          bool ok = eprices_nvs::save_tomorrow(
+            id(tomorrow_entry_count), id(tomorrow_date_str),
+            id(price_values_tomorrow), id(price_timestamps_tomorrow));
+
+          auto fmt = [](const std::string &s) -> std::string {
+            if (s.size() != 8 || s == "00000000") return std::string("Unknown");
+            return s.substr(0,4) + "-" + s.substr(4,2) + "-" + s.substr(6,2);
+          };
+
+          char buf[80];
+          if (ok) snprintf(buf, sizeof(buf), "Stored %d pts for %s",
+                           id(tomorrow_entry_count), fmt(id(tomorrow_date_str)).c_str());
+          else    snprintf(buf, sizeof(buf), "Store FAILED");
+          id(tomorrow_nvs_status).publish_state(buf);
+
+  - id: nvs_load_tomorrow_script
+    then:
+      - lambda: |-
+          auto now = id(ha_time).now();
+          time_t tmr_t = (time_t)now.timestamp + 86400;
+          struct tm *tmr_tm = localtime(&tmr_t);
+          char tmr_buf[9];
+          snprintf(tmr_buf, sizeof(tmr_buf), "%04d%02d%02d",
+                   tmr_tm->tm_year + 1900, tmr_tm->tm_mon + 1, tmr_tm->tm_mday);
+          std::string expected(tmr_buf);
+
+          std::vector<float>   pv;
+          std::vector<int64_t> ts;
+          int cnt = 0;
+          bool ok = eprices_nvs::load_tomorrow(expected, pv, ts, cnt);
+          if (ok) {
+            id(price_values_tomorrow)     = pv;
+            id(price_timestamps_tomorrow) = ts;
+            id(tomorrow_entry_count)      = cnt;
+            id(tomorrow_date_str)         = expected;
+
+            auto fmt = [](const std::string &s) -> std::string {
+              if (s.size() != 8 || s == "00000000") return std::string("Unknown");
+              return s.substr(0,4) + "-" + s.substr(4,2) + "-" + s.substr(6,2);
+            };
+
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Loaded %d pts for %s", cnt, fmt(expected).c_str());
+            id(tomorrow_nvs_status).publish_state(buf);
+          } else {
+            id(tomorrow_entry_count) = 0;
+            id(tomorrow_nvs_status).publish_state("Load FAILED / stale");
+          }
+
+  # ---------------------------------------------------------------------------
+  # AUTO TODAY UPDATE SCHEDULER (enables retry mode)
+  # Used only by boot recovery + midnight fallback.
+  # ---------------------------------------------------------------------------
+  - id: schedule_auto_today_update
+    then:
+      - lambda: |-
+          id(auto_today_retry_active) = true;
+          id(auto_today_retry_count) = 0;
+          id(need_today_update) = true;
+          ESP_LOGI("eprices", "Auto today: scheduled (retry mode enabled)");
+
+  # ---------------------------------------------------------------------------
+  # JSON PARSER – TODAY
+  # ---------------------------------------------------------------------------
+  - id: parse_energy_charts_today_script
+    parameters:
+      raw_body: string
+    then:
+      - lambda: |-
+          const double MULT = (1.0 + id(prov_fee)) * (1.0 + id(vat_rate));
+
+          id(price_values_today).clear();
+          id(price_timestamps_today).clear();
+          id(today_entry_count) = 0;
+
+          // Extract flat array contents between [ and ]
+          auto extract_array = [](const std::string &s, const std::string &key) -> std::string {
+            std::string needle = "\"" + key + "\"";
+            size_t kp = s.find(needle);
+            if (kp == std::string::npos) return "";
+            size_t ab = s.find('[', kp + needle.size());
+            if (ab == std::string::npos) return "";
+            size_t ae = s.find(']', ab);
+            if (ae == std::string::npos) return "";
+            return s.substr(ab + 1, ae - ab - 1);
+          };
+
+          std::string ts_body  = extract_array(raw_body, "unix_seconds");
+          std::string prc_body = extract_array(raw_body, "price");
+          if (ts_body.empty() || prc_body.empty()) {
+            ESP_LOGW("eprices", "parse_today: arrays not found in response");
+            id(last_update_success) = false;
+            id(update_status_message) = "parse_today: arrays not found";
+            return;
+          }
+
+          // Tokenise comma-separated values
+          auto tokenise = [](const std::string &body) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            std::string tok;
+            for (char c : body) {
+              if (c == ',') {
+                if (!tok.empty()) { out.push_back(tok); tok.clear(); }
+              } else if (c > ' ') {
+                tok += c;
+              }
+            }
+            if (!tok.empty()) out.push_back(tok);
+            return out;
+          };
+
+          auto ts_toks  = tokenise(ts_body);
+          auto prc_toks = tokenise(prc_body);
+          size_t n = std::min(ts_toks.size(), prc_toks.size());
+
+          if (n == 0) {
+            ESP_LOGW("eprices", "parse_today: no tokens found");
+            id(last_update_success) = false;
+            id(update_status_message) = "parse_today: no tokens";
+            return;
+          }
+
+          ESP_LOGI("eprices", "parse_today: %d token pairs found", (int)n);
+
+          // Validate: check that timestamps belong to today in LOCAL time
+          // using only the FIRST entry to determine the date of this dataset.
+          // Accept ALL entries from the response without per-entry filtering
+          // (the API returns exactly one day of data per request).
+          auto now = id(ha_time).now();
+          char today_buf[9];
+          snprintf(today_buf, sizeof(today_buf), "%04d%02d%02d",
+                   now.year, now.month, now.day_of_month);
+
+          // Check first timestamp's LOCAL date matches today
+          int64_t first_ts = (int64_t)strtoll(ts_toks[0].c_str(), nullptr, 10);
+          time_t ft = (time_t)first_ts;
+          struct tm *ftm = localtime(&ft);
+          if (ftm) {
+            char first_date[9];
+            snprintf(first_date, sizeof(first_date), "%04d%02d%02d",
+                     ftm->tm_year + 1900, ftm->tm_mon + 1, ftm->tm_mday);
+            // Allow one day tolerance: the API returns UTC-midnight-anchored data,
+            // so in CET (UTC+1) the first entry's local date may be yesterday.
+            // We accept the data regardless and just log a warning.
+            if (strcmp(first_date, today_buf) != 0) {
+              ESP_LOGW("eprices", "parse_today: first entry local date %s != today %s (UTC offset expected)",
+                       first_date, today_buf);
+            }
+          }
+
+          for (size_t i = 0; i < n; i++) {
+            if (prc_toks[i] == "null") continue;
+            char *end1 = nullptr, *end2 = nullptr;
+            int64_t unix_ts = (int64_t)strtoll(ts_toks[i].c_str(), &end1, 10);
+            float   raw_mwh = strtof(prc_toks[i].c_str(), &end2);
+            if (end1 == ts_toks[i].c_str() || end2 == prc_toks[i].c_str()) continue;
+            if (unix_ts <= 0) continue;
+
+            float eur_kwh = (float)((double)raw_mwh * MULT / 1000.0);
+            id(price_timestamps_today).push_back(unix_ts);
+            id(price_values_today).push_back(eur_kwh);
+          }
+
+          id(today_entry_count) = (int)id(price_timestamps_today).size();
+          id(today_date_str)    = std::string(today_buf);
+
+          ESP_LOGI("eprices", "parse_today: stored %d entries, date=%s",
+                   id(today_entry_count), today_buf);
+
+  # ---------------------------------------------------------------------------
+  # JSON PARSER – TOMORROW
+  # ---------------------------------------------------------------------------
+  - id: parse_energy_charts_tomorrow_script
+    parameters:
+      raw_body: string
+    then:
+      - lambda: |-
+          const double MULT = (1.0 + id(prov_fee)) * (1.0 + id(vat_rate));
+
+          id(price_values_tomorrow).clear();
+          id(price_timestamps_tomorrow).clear();
+          id(tomorrow_entry_count) = 0;
+
+          auto extract_array = [](const std::string &s, const std::string &key) -> std::string {
+            std::string needle = "\"" + key + "\"";
+            size_t kp = s.find(needle);
+            if (kp == std::string::npos) return "";
+            size_t ab = s.find('[', kp + needle.size());
+            if (ab == std::string::npos) return "";
+            size_t ae = s.find(']', ab);
+            if (ae == std::string::npos) return "";
+            return s.substr(ab + 1, ae - ab - 1);
+          };
+
+          std::string ts_body  = extract_array(raw_body, "unix_seconds");
+          std::string prc_body = extract_array(raw_body, "price");
+          if (ts_body.empty() || prc_body.empty()) {
+            ESP_LOGW("eprices", "parse_tomorrow: arrays not found in response");
+            id(tomorrow_last_update_success) = false;
+            id(tomorrow_update_status_message) = "parse_tomorrow: arrays not found";
+            return;
+          }
+
+          auto tokenise = [](const std::string &body) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            std::string tok;
+            for (char c : body) {
+              if (c == ',') {
+                if (!tok.empty()) { out.push_back(tok); tok.clear(); }
+              } else if (c > ' ') {
+                tok += c;
+              }
+            }
+            if (!tok.empty()) out.push_back(tok);
+            return out;
+          };
+
+          auto ts_toks  = tokenise(ts_body);
+          auto prc_toks = tokenise(prc_body);
+          size_t n = std::min(ts_toks.size(), prc_toks.size());
+
+          if (n == 0) {
+            ESP_LOGW("eprices", "parse_tomorrow: no tokens found");
+            id(tomorrow_last_update_success) = false;
+            id(tomorrow_update_status_message) = "parse_tomorrow: no tokens";
+            return;
+          }
+
+          ESP_LOGI("eprices", "parse_tomorrow: %d token pairs found", (int)n);
+
+          auto now = id(ha_time).now();
+          time_t tmr_t = (time_t)now.timestamp + 86400;
+          struct tm *tmr_tm = localtime(&tmr_t);
+          char tmr_buf[9];
+          snprintf(tmr_buf, sizeof(tmr_buf), "%04d%02d%02d",
+                   tmr_tm->tm_year + 1900, tmr_tm->tm_mon + 1, tmr_tm->tm_mday);
+
+          for (size_t i = 0; i < n; i++) {
+            if (prc_toks[i] == "null") continue;
+            char *end1 = nullptr, *end2 = nullptr;
+            int64_t unix_ts = (int64_t)strtoll(ts_toks[i].c_str(), &end1, 10);
+            float   raw_mwh = strtof(prc_toks[i].c_str(), &end2);
+            if (end1 == ts_toks[i].c_str() || end2 == prc_toks[i].c_str()) continue;
+            if (unix_ts <= 0) continue;
+
+            float eur_kwh = (float)((double)raw_mwh * MULT / 1000.0);
+            id(price_timestamps_tomorrow).push_back(unix_ts);
+            id(price_values_tomorrow).push_back(eur_kwh);
+          }
+
+          id(tomorrow_entry_count) = (int)id(price_timestamps_tomorrow).size();
+          id(tomorrow_date_str)    = std::string(tmr_buf);
+
+          ESP_LOGI("eprices", "parse_tomorrow: stored %d entries, date=%s",
+                   id(tomorrow_entry_count), tmr_buf);
+
+  # ---------------------------------------------------------------------------
+  # RECOMPUTE TODAY – fills legacy 96/24-slot vectors + JSON text sensors
+  # ---------------------------------------------------------------------------
+  - id: recompute_today
+    then:
+      - lambda: |-
+          int n = id(today_entry_count);
+          if (n == 0) { ESP_LOGW("eprices", "recompute_today: no entries"); return; }
+
+          // Map timestamps into legacy 96-slot grid.
+          // NOTE: on DST fall-back days (25h) the second occurrence of the
+          // repeated hour overwrites the first in this grid.
+          // Live price sensors use price_timestamps_today[] and are unaffected.
+          id(hourly_prices).assign(96, NAN);
+          for (int i = 0; i < n; i++) {
+            time_t t = (time_t)id(price_timestamps_today)[i];
+            struct tm *tmi = localtime(&t);
+            if (!tmi) continue;
+            int slot = tmi->tm_hour * 4 + tmi->tm_min / 15;
+            if (slot >= 0 && slot < 96)
+              id(hourly_prices)[slot] = id(price_values_today)[i];
+          }
+
+          auto &v = id(hourly_prices);
+
+          float min_v = 9999.0f, max_v = -9999.0f;
+          int   min_idx = 0, max_idx = 0;
+          for (int i = 0; i < 96; i++) {
+            if (!std::isnan(v[i])) {
+              if (v[i] < min_v) { min_v = v[i]; min_idx = i; }
+              if (v[i] > max_v) { max_v = v[i]; max_idx = i; }
+            }
+          }
+
+          std::vector<float> h_sums(24, 0.0f);
+          std::vector<int>   h_cnt(24, 0);
+          for (int i = 0; i < 96; i++)
+            if (!std::isnan(v[i])) { h_sums[i/4] += v[i]; h_cnt[i/4]++; }
+
+          float h_min_v = 9999.0f, h_max_v = -9999.0f;
+          int   h_min_i = 0, h_max_i = 0;
+          double raw_sum = 0.0; int cnt_kwh = 0;
+          std::string json_h = "[";
+          for (int i = 0; i < 24; i++) {
+            if (h_cnt[i] > 0) {
+              float ha = h_sums[i] / (float)h_cnt[i];
+              id(hourly_avg_prices_kwh)[i] = ha;
+              if (ha < h_min_v) { h_min_v = ha; h_min_i = i; }
+              if (ha > h_max_v) { h_max_v = ha; h_max_i = i; }
+              char pb[12]; sprintf(pb, "%.4f", ha); json_h += pb;
+              raw_sum += ha; cnt_kwh++;
+            } else {
+              id(hourly_avg_prices_kwh)[i] = NAN;
+              json_h += "null";
+            }
+            if (i < 23) json_h += ",";
+          }
+          json_h += "]";
+          id(json_hourly_prices_kwh).publish_state(json_h.c_str());
+
+          auto build32 = [&](int start) -> std::string {
+            std::string j = "[";
+            for (int i = start; i < start + 32; i++) {
+              if (!std::isnan(v[i])) {
+                char pb[16];
+                // Use 3 decimal places for negative prices to stay within
+                // the 255-character HA text sensor state limit.
+                // Positive prices keep full 4 decimal place precision.
+                if (v[i] < 0.0f)
+                  snprintf(pb, sizeof(pb), "%.3f", v[i]);
+                else
+                  snprintf(pb, sizeof(pb), "%.4f", v[i]);
+                j += pb;
+              } else {
+                j += "null";
+              }
+              if (i < start + 31) j += ",";
+            }
+            j += "]"; return j;
+          };
+          id(json_15min_prices_kwh_p1_00_00_07_45).publish_state(build32(0));
+          id(json_15min_prices_kwh_p2_08_00_15_45).publish_state(build32(32));
+          id(json_15min_prices_kwh_p3_16_00_23_45).publish_state(build32(64));
+
+          if (min_v < 9999.0f) {
+            id(min_price).publish_state(min_v);
+            id(max_price).publish_state(max_v);
+            char tb[6];
+            sprintf(tb,"%02d:%02d",min_idx/4,(min_idx%4)*15); id(min_price_time_str)=tb;
+            sprintf(tb,"%02d:%02d",max_idx/4,(max_idx%4)*15); id(max_price_time_str)=tb;
+          }
+          if (h_min_v < 9999.0f) {
+            id(min_hourly_price).publish_state(h_min_v);
+            id(max_hourly_price).publish_state(h_max_v);
+            char hb[6];
+            sprintf(hb,"%02d:00",h_min_i); id(min_hourly_price_time_str)=hb;
+            sprintf(hb,"%02d:00",h_max_i); id(max_hourly_price_time_str)=hb;
+          }
+          if (cnt_kwh > 0) id(avg_price).publish_state((float)(raw_sum / cnt_kwh));
+
+          id(last_successful_update) = id(ha_time).now().timestamp;
+          id(last_update_success) = true;
+
+          int64_t ts_now = (int64_t)id(ha_time).now().timestamp;
+          int cur = -1;
+          for (int j = n - 1; j >= 0; --j)
+            if (id(price_timestamps_today)[j] <= ts_now) { cur = j; break; }
+          // Staleness check: if stored date doesn't match today, flag as stale
+          auto now_check = id(ha_time).now();
+          char today_check[9];
+          snprintf(today_check, sizeof(today_check), "%04d%02d%02d",
+                   now_check.year, now_check.month, now_check.day_of_month);
+          if (id(today_date_str) != std::string(today_check)) {
+            id(current_price_status_str) = "Stale";
+          } else {
+            id(current_price_status_str) = (cur >= 0) ? "Valid" : "Missing";
+          }
+
+  # ---------------------------------------------------------------------------
+  # RECOMPUTE TOMORROW
+  # ---------------------------------------------------------------------------
+  - id: recompute_tomorrow
+    then:
+      - lambda: |-
+          int n = id(tomorrow_entry_count);
+          if (n == 0) { ESP_LOGW("eprices", "recompute_tomorrow: no entries"); return; }
+
+          // NOTE: same DST fall-back caveat as recompute_today for legacy grid.
+          id(tomorrow_hourly_prices).assign(96, NAN);
+          for (int i = 0; i < n; i++) {
+            time_t t = (time_t)id(price_timestamps_tomorrow)[i];
+            struct tm *tmi = localtime(&t);
+            if (!tmi) continue;
+            int slot = tmi->tm_hour * 4 + tmi->tm_min / 15;
+            if (slot >= 0 && slot < 96)
+              id(tomorrow_hourly_prices)[slot] = id(price_values_tomorrow)[i];
+          }
+
+          auto &v = id(tomorrow_hourly_prices);
+
+          float min_v = 9999.0f, max_v = -9999.0f;
+          int   min_idx = 0, max_idx = 0;
+          for (int i = 0; i < 96; i++) {
+            if (!std::isnan(v[i])) {
+              if (v[i] < min_v) { min_v = v[i]; min_idx = i; }
+              if (v[i] > max_v) { max_v = v[i]; max_idx = i; }
+            }
+          }
+
+          std::vector<float> h_sums(24, 0.0f);
+          std::vector<int>   h_cnt(24, 0);
+          for (int i = 0; i < 96; i++)
+            if (!std::isnan(v[i])) { h_sums[i/4] += v[i]; h_cnt[i/4]++; }
+
+          float h_min_v = 9999.0f, h_max_v = -9999.0f;
+          int   h_min_i = 0, h_max_i = 0;
+          double raw_sum = 0.0; int cnt_kwh = 0;
+          std::string json_h = "[";
+          for (int i = 0; i < 24; i++) {
+            if (h_cnt[i] > 0) {
+              float ha = h_sums[i] / (float)h_cnt[i];
+              id(tomorrow_hourly_avg_prices_kwh)[i] = ha;
+              if (ha < h_min_v) { h_min_v = ha; h_min_i = i; }
+              if (ha > h_max_v) { h_max_v = ha; h_max_i = i; }
+              char pb[12]; sprintf(pb, "%.4f", ha); json_h += pb;
+              raw_sum += ha; cnt_kwh++;
+            } else {
+              id(tomorrow_hourly_avg_prices_kwh)[i] = NAN;
+              json_h += "null";
+            }
+            if (i < 23) json_h += ",";
+          }
+          json_h += "]";
+          id(json_tomorrow_hourly_prices_kwh).publish_state(json_h.c_str());
+
+          auto build32 = [&](int start) -> std::string {
+            std::string j = "[";
+            for (int i = start; i < start + 32; i++) {
+              if (!std::isnan(v[i])) {
+                char pb[16];
+                // Use 3 decimal places for negative prices to stay within
+                // the 255-character HA text sensor state limit.
+                // Positive prices keep full 4 decimal place precision.
+                if (v[i] < 0.0f)
+                  snprintf(pb, sizeof(pb), "%.3f", v[i]);
+                else
+                  snprintf(pb, sizeof(pb), "%.4f", v[i]);
+                j += pb;
+              } else {
+                j += "null";
+              }
+              if (i < start + 31) j += ",";
+            }
+            j += "]"; return j;
+          };
+          id(json_tomorrow_15min_prices_kwh_p1_00_00_07_45).publish_state(build32(0));
+          id(json_tomorrow_15min_prices_kwh_p2_08_00_15_45).publish_state(build32(32));
+          id(json_tomorrow_15min_prices_kwh_p3_16_00_23_45).publish_state(build32(64));
+
+          if (min_v < 9999.0f) {
+            id(tomorrow_min_price).publish_state(min_v);
+            id(tomorrow_max_price).publish_state(max_v);
+            char tb[6];
+            sprintf(tb,"%02d:%02d",min_idx/4,(min_idx%4)*15); id(tomorrow_min_price_time_str)=tb;
+            sprintf(tb,"%02d:%02d",max_idx/4,(max_idx%4)*15); id(tomorrow_max_price_time_str)=tb;
+          }
+          if (h_min_v < 9999.0f) {
+            id(tomorrow_min_hourly_price).publish_state(h_min_v);
+            id(tomorrow_max_hourly_price).publish_state(h_max_v);
+            char hb[6];
+            sprintf(hb,"%02d:00",h_min_i); id(tomorrow_min_hourly_price_time_str)=hb;
+            sprintf(hb,"%02d:00",h_max_i); id(tomorrow_max_hourly_price_time_str)=hb;
+          }
+          if (cnt_kwh > 0) id(tomorrow_avg_price).publish_state((float)(raw_sum / cnt_kwh));
+
+          id(tomorrow_last_update_success) = true;
+
+          // -------------------------------------------------------------------
+          // Set Tomorrow Current Price Status consistently (like recompute_today)
+          // "Current" for tomorrow = tomorrow at the same local time (now + 86400s)
+          // -------------------------------------------------------------------
+          int64_t ts_now_tomorrow = (int64_t)id(ha_time).now().timestamp + 86400;
+          int cur = -1;
+          for (int j = n - 1; j >= 0; --j)
+            if (id(price_timestamps_tomorrow)[j] <= ts_now_tomorrow) { cur = j; break; }
+          id(tomorrow_current_price_status_str) = (cur >= 0) ? "Valid" : "Missing";
+          id(tomorrow_last_update_attempt) = id(ha_time).now().timestamp;
+
+  # ---------------------------------------------------------------------------
+  # MIDNIGHT BRIDGE
+  # ---------------------------------------------------------------------------
+  - id: midnight_bridge_promotion
+    then:
+      - lambda: |-
+          if (id(tomorrow_entry_count) > 0) {
+            ESP_LOGI("eprices", "midnight_bridge: %d entries -> today", id(tomorrow_entry_count));
+            id(price_values_today)     = id(price_values_tomorrow);
+            id(price_timestamps_today) = id(price_timestamps_tomorrow);
+            id(today_entry_count)      = id(tomorrow_entry_count);
+            id(today_date_str)         = id(tomorrow_date_str);
+
+            // Clear tomorrow core arrays immediately
+            id(price_values_tomorrow).clear();
+            id(price_timestamps_tomorrow).clear();
+            id(tomorrow_entry_count) = 0;
+            id(tomorrow_date_str)    = "00000000";
+
+            // Recompute + persist today's data
+            id(recompute_today).execute();
+            id(nvs_save_today_script).execute();
+
+            // Clear tomorrow NVS slot (persistent)
+            eprices_nvs::clear_tomorrow_slot();
+
+            // Clear all "tomorrow" published sensor states + JSON to avoid stale data in HA
+            id(clear_tomorrow_prices).execute();
+
+            // Ensure NVS status text reflects the clear immediately
+            id(tomorrow_nvs_status).publish_state("Cleared");
+
+            id(last_update_success) = true;
+            id(update_status_message) = "Midnight bridge OK";
+            id(last_update_source).publish_state("midnight_bridge");
+            id(today_last_api_fetch_time) = std::string("Never");
+            id(today_last_api_fetch_time_sensor).publish_state("Never");
+            id(tomorrow_retry_count) = 0;
+            id(tomorrow_price_update_attempts).publish_state("0");
+
+            // Only schedule tomorrow HTTP update if time is valid AND we're in the allowed window
+            auto t = id(ha_time).now();
+            if (t.is_valid()) {
+              bool in_window = (t.hour > 13 && t.hour < 23) ||
+                               (t.hour == 13 && t.minute >= 20) ||
+                               (t.hour == 23 && t.minute <= 50);
+              if (in_window) {
+                id(need_tomorrow_update) = true;
+              } else {
+                id(need_tomorrow_update) = false;  // avoid sitting "true" outside window
+              }
+            } else {
+              id(need_tomorrow_update) = false;    // time invalid -> don't arm windowed worker
+            }
+          } else {
+            ESP_LOGW("eprices", "midnight_bridge: no tomorrow data – clearing today + scheduling HTTP");
+
+            // Clear today to avoid showing yesterday's prices after rollover
+            id(clear_today_prices).execute();
+
+            // Message + schedule fresh HTTP fetch for today's data
+            id(update_status_message) = "Midnight: no tomorrow data; fetching today via HTTP";
+            id(last_update_success) = false;
+            id(last_update_source).publish_state("midnight_no_tomorrow");
+            id(schedule_auto_today_update).execute();
+          }
+
+  # ---------------------------------------------------------------------------
+  # HTTP FETCH – TODAY
+  # ---------------------------------------------------------------------------
+  - id: smart_price_update
+    then:
+      - lambda: |-
+          if (id(is_updating_today)) {
+            ESP_LOGW("eprices", "smart_price_update: already running, skip");
+            return;
+          }
+          id(is_updating_today) = true;
+          id(last_update_attempt) = id(ha_time).now().timestamp;
+          id(retry_count)++;
+          { char buf[8]; snprintf(buf, sizeof(buf), "%d", id(retry_count)); id(today_price_update_attempts).publish_state(buf); }
+          // Pre-compute URL into global
+          char url[128];
+          snprintf(url, sizeof(url),
+                   "https://api.energy-charts.info/price?bzn=%s",
+                   id(country_bzn).c_str());
+          id(fetch_url_today) = std::string(url);
+          ESP_LOGI("eprices", "Today fetch URL: %s", url);
+      - http_request.get:
+          url: !lambda "return id(fetch_url_today);"
+          capture_response: true
+          max_response_buffer_size: 16384
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code != 200) {
+                    char m[40]; sprintf(m, "HTTP error %d", response->status_code);
+                    id(update_status_message) = std::string(m);
+                    id(last_update_success) = false;
+                    id(is_updating_today) = false;
+                    ESP_LOGW("eprices", "Today fetch: %s", m);
+                    return;
+                  }
+                  if (body.empty()) {
+                    id(update_status_message) = std::string("Empty response body");
+                    id(last_update_success) = false;
+                    id(is_updating_today) = false;
+                    ESP_LOGW("eprices", "Today fetch: empty body");
+                    return;
+                  }
+                  ESP_LOGI("eprices", "Today fetch: body len=%d", (int)body.size());
+                  id(parse_energy_charts_today_script).execute(body);
+              - script.execute: after_today_fetch
+
+  - id: after_today_fetch
+    then:
+      - lambda: |-
+          if (id(today_entry_count) > 0) {
+            id(recompute_today).execute();
+            id(nvs_save_today_script).execute();
+            char m[50]; sprintf(m, "Success (%d pts)", id(today_entry_count));
+            id(update_status_message) = std::string(m);
+            id(last_update_success) = true;
+            id(last_update_source).publish_state("HTTP_today");
+
+            // Stamp API fetch time
+            auto nt = id(ha_time).now();
+            char tbuf[20];
+            snprintf(tbuf, sizeof(tbuf), "%04d-%02d-%02d %02d:%02d:%02d",
+                     nt.year, nt.month, nt.day_of_month,
+                     nt.hour, nt.minute, nt.second);
+            id(today_last_api_fetch_time) = std::string(tbuf);
+            id(today_last_api_fetch_time_sensor).publish_state(tbuf);
+
+            // If we were in auto retry mode, stop retrying now.
+            if (id(auto_today_retry_active)) {
+              ESP_LOGI("eprices", "Auto today: success after %d failed attempt(s)", id(auto_today_retry_count));
+              id(auto_today_retry_active) = false;
+            }
+          } else {
+            id(last_update_success) = false;
+            id(update_status_message) = "No data points parsed";
+            ESP_LOGW("eprices", "after_today_fetch: no entries after parse");
+
+            // Only auto-triggered updates should retry.
+            if (id(auto_today_retry_active)) {
+              id(auto_today_retry_count) += 1;
+              ESP_LOGW("eprices", "Auto today: failure, auto_today_retry_count=%d", id(auto_today_retry_count));
+
+              if (id(auto_today_retry_count) >= 8) {
+                id(auto_today_retry_active) = false;
+                id(update_status_message) = "Auto today: failed after 8 attempts";
+                ESP_LOGW("eprices", "Auto today: giving up after 8 attempts");
+              } else {
+                // Re-arm worker for another quick try (plus scheduled retries later)
+                id(need_today_update) = true;
+              }
+            }
+          }
+
+          id(today_price_update_status).update();
+          id(today_price_status_message).update();
+          id(today_current_price_status).update();
+          id(current_price).update();
+          id(today_current_hourly_price).update();
+          id(today_current_max_hourly_price_percentage).update();
+          id(max_hourly_price_time).update();
+          id(min_hourly_price_time).update();
+          id(is_updating_today) = false;
+
+  # ---------------------------------------------------------------------------
+  # HTTP FETCH – TOMORROW
+  # ---------------------------------------------------------------------------
+  - id: smart_tomorrow_price_update
+    then:
+      - lambda: |-
+          if (id(is_updating_tomorrow)) {
+            ESP_LOGW("eprices", "smart_tomorrow_price_update: already running, skip");
+            return;
+          }
+          id(is_updating_tomorrow) = true;
+          id(tomorrow_last_update_attempt) = id(ha_time).now().timestamp;
+          id(tomorrow_retry_count)++;
+          { char buf[8]; snprintf(buf, sizeof(buf), "%d", id(tomorrow_retry_count)); id(tomorrow_price_update_attempts).publish_state(buf); }
+          // Pre-compute URL into global
+          auto now = id(ha_time).now();
+          time_t tmr_t = (time_t)now.timestamp + 86400;
+          struct tm *tmr_tm = localtime(&tmr_t);
+          char url[128];
+          snprintf(url, sizeof(url),
+                   "https://api.energy-charts.info/price?bzn=%s&start=%04d-%02d-%02d",
+                   id(country_bzn).c_str(),
+                   tmr_tm->tm_year + 1900, tmr_tm->tm_mon + 1, tmr_tm->tm_mday);
+          id(fetch_url_tomorrow) = std::string(url);
+          ESP_LOGI("eprices", "Tomorrow fetch URL: %s", url);
+      - http_request.get:
+          url: !lambda "return id(fetch_url_tomorrow);"
+          capture_response: true
+          max_response_buffer_size: 16384
+          on_response:
+            then:
+              - lambda: |-
+                  if (response->status_code != 200) {
+                    char m[40]; sprintf(m, "HTTP error %d", response->status_code);
+                    id(tomorrow_update_status_message) = std::string(m);
+                    id(tomorrow_last_update_success) = false;
+                    id(is_updating_tomorrow) = false;
+                    ESP_LOGW("eprices", "Tomorrow fetch: %s", m);
+                    return;
+                  }
+                  if (body.empty()) {
+                    id(tomorrow_update_status_message) = std::string("Empty response body");
+                    id(tomorrow_last_update_success) = false;
+                    id(is_updating_tomorrow) = false;
+                    ESP_LOGW("eprices", "Tomorrow fetch: empty body");
+                    return;
+                  }
+                  ESP_LOGI("eprices", "Tomorrow fetch: body len=%d", (int)body.size());
+                  id(parse_energy_charts_tomorrow_script).execute(body);
+              - script.execute: after_tomorrow_fetch
+
+  - id: after_tomorrow_fetch
+    then:
+      - lambda: |-
+          if (id(tomorrow_entry_count) > 0) {
+            id(recompute_tomorrow).execute();
+            id(nvs_save_tomorrow_script).execute();
+            char m[50]; sprintf(m, "Success (%d pts)", id(tomorrow_entry_count));
+            id(tomorrow_update_status_message) = std::string(m);
+            id(tomorrow_last_update_success) = true;
+            id(tomorrow_last_successful_update) = id(ha_time).now().timestamp;
+
+            // Stamp API fetch time
+            auto nt = id(ha_time).now();
+            char tbuf[20];
+            snprintf(tbuf, sizeof(tbuf), "%04d-%02d-%02d %02d:%02d:%02d",
+                     nt.year, nt.month, nt.day_of_month,
+                     nt.hour, nt.minute, nt.second);
+            id(tomorrow_last_api_fetch_time) = std::string(tbuf);
+            id(tomorrow_last_api_fetch_time_sensor).publish_state(tbuf);
+          } else {
+            id(tomorrow_last_update_success) = false;
+            id(tomorrow_update_status_message) = "No data points parsed";
+            ESP_LOGW("eprices", "after_tomorrow_fetch: no entries after parse");
+          }
+          id(tomorrow_price_update_status).update();
+          id(tomorrow_price_status_message).update();
+          id(tomorrow_current_price_status).update();
+          id(tomorrow_current_price).update();
+          id(tomorrow_current_hourly_price).update();
+          id(tomorrow_current_max_hourly_price_percentage).update();
+          id(tomorrow_max_hourly_price_time).update();
+          id(tomorrow_min_hourly_price_time).update();
+          id(is_updating_tomorrow) = false;
+
+  # ---------------------------------------------------------------------------
+  # BOOT RECOVERY – TODAY
+  # ---------------------------------------------------------------------------
+  - id: boot_recovery_today_script
+    then:
+      - lambda: |-
+          if (id(boot_recovery_executed)) {
+            ESP_LOGD("eprices", "boot_recovery_today: already done");
+            return;
+          }
+          id(boot_recovery_executed) = true;
+          id(today_price_update_attempts).publish_state("0");
+
+          auto t_now = id(ha_time).now();
+          if (!t_now.is_valid()) {
+            ESP_LOGW("eprices", "boot_recovery_today: time invalid, schedule HTTP");
+            id(schedule_auto_today_update).execute();
+            return;
+          }
+
+          id(nvs_load_today_script).execute();
+
+          if (id(today_entry_count) > 0) {
+            id(recompute_today).execute();
+            id(last_update_success) = true;
+            id(update_status_message) = "Loaded from NVS (boot)";
+            id(last_update_source).publish_state("NVS_boot");
+            id(today_current_price_status).update();
+            id(today_price_update_status).update();
+            id(today_price_status_message).update();
+            id(current_price).update();
+            id(today_current_hourly_price).update();
+            id(today_current_max_hourly_price_percentage).update();
+            id(max_hourly_price_time).update();
+            id(min_hourly_price_time).update();
+          } else {
+            ESP_LOGW("eprices", "boot_recovery_today: NVS miss – schedule HTTP");
+            id(schedule_auto_today_update).execute();
+          }
+
+  # ---------------------------------------------------------------------------
+  # BOOT RECOVERY – TOMORROW
+  # ---------------------------------------------------------------------------
+  - id: boot_recovery_tomorrow_script
+    then:
+      - lambda: |-
+          if (id(tomorrow_boot_recovery_executed)) {
+            ESP_LOGD("eprices", "boot_recovery_tomorrow: already done");
+            return;
+          }
+          id(tomorrow_boot_recovery_executed) = true;
+          id(tomorrow_price_update_attempts).publish_state("0");
+
+          auto t = id(ha_time).now();
+          if (!t.is_valid()) {
+            ESP_LOGW("eprices", "boot_recovery_tomorrow: time invalid, schedule HTTP");
+            id(need_tomorrow_update) = true;
+            return;
+          }
+
+          bool in_window = (t.hour > 13 && t.hour < 23) ||
+                           (t.hour == 13 && t.minute >= 20) ||
+                           (t.hour == 23 && t.minute <= 50);
+          if (!in_window) {
+            ESP_LOGI("eprices", "boot_recovery_tomorrow: outside window, skip");
+            id(tomorrow_last_price_update_time).publish_state("Outside fetch window");
+            return;
+          }
+
+          id(nvs_load_tomorrow_script).execute();
+
+          if (id(tomorrow_entry_count) > 0) {
+            id(recompute_tomorrow).execute();
+            id(tomorrow_last_update_success) = true;
+            id(tomorrow_update_status_message) = "Loaded from NVS (boot)";
+            id(tomorrow_current_price_status).update();
+            id(tomorrow_price_update_status).update();
+            id(tomorrow_price_status_message).update();
+            id(tomorrow_current_price).update();
+            id(tomorrow_current_hourly_price).update();
+            id(tomorrow_current_max_hourly_price_percentage).update();
+            id(tomorrow_max_hourly_price_time).update();
+            id(tomorrow_min_hourly_price_time).update();
+          } else {
+            ESP_LOGW("eprices", "boot_recovery_tomorrow: NVS miss – schedule HTTP");
+            id(need_tomorrow_update) = true;
+          }
+
+  # ---------------------------------------------------------------------------
+  # CLEAR SCRIPTS
+  # ---------------------------------------------------------------------------
+  - id: clear_today_prices
+    then:
+      - lambda: |-
+          ESP_LOGW("eprices", "Clearing today price data");
+          id(price_values_today).clear();
+          id(price_timestamps_today).clear();
+          id(today_entry_count) = 0;
+          id(today_date_str) = "00000000";
+          id(hourly_prices).assign(96, NAN);
+          id(hourly_avg_prices_kwh).assign(24, NAN);
+          id(current_price).publish_state(NAN);
+          id(today_next_price).publish_state(NAN);
+          id(avg_price).publish_state(NAN);
+          id(min_price).publish_state(NAN);
+          id(max_price).publish_state(NAN);
+          id(today_current_hourly_price).publish_state(NAN);
+          id(today_next_hourly_price).publish_state(NAN);
+          id(min_hourly_price).publish_state(NAN);
+          id(max_hourly_price).publish_state(NAN);
+          id(today_current_max_hourly_price_percentage).publish_state(NAN);
+          id(last_update_success) = false;
+          id(update_status_message) = "Cleared – awaiting NVS or HTTP";
+          id(json_hourly_prices_kwh).publish_state("[]");
+          id(json_15min_prices_kwh_p1_00_00_07_45).publish_state("");
+          id(json_15min_prices_kwh_p2_08_00_15_45).publish_state("");
+          id(json_15min_prices_kwh_p3_16_00_23_45).publish_state("");
+          id(min_price_time_str) = "--:--";
+          id(max_price_time_str) = "--:--";
+          id(min_hourly_price_time_str) = "--:--";
+          id(max_hourly_price_time_str) = "--:--";
+          id(today_price_update_status).update();
+          id(today_price_status_message).update();
+          id(current_price_status_str) = "Cleared";
+          id(today_current_price_status).update();
+
+  - id: clear_tomorrow_prices
+    then:
+      - lambda: |-
+          ESP_LOGW("eprices", "Clearing tomorrow price data");
+          id(price_values_tomorrow).clear();
+          id(price_timestamps_tomorrow).clear();
+          id(tomorrow_entry_count) = 0;
+          id(tomorrow_date_str) = "00000000";
+          id(tomorrow_hourly_prices).assign(96, NAN);
+          id(tomorrow_hourly_avg_prices_kwh).assign(24, NAN);
+          id(tomorrow_current_price).publish_state(NAN);
+          id(tomorrow_next_price).publish_state(NAN);
+          id(tomorrow_avg_price).publish_state(NAN);
+          id(tomorrow_min_price).publish_state(NAN);
+          id(tomorrow_max_price).publish_state(NAN);
+          id(tomorrow_current_hourly_price).publish_state(NAN);
+          id(tomorrow_next_hourly_price).publish_state(NAN);
+          id(tomorrow_min_hourly_price).publish_state(NAN);
+          id(tomorrow_max_hourly_price).publish_state(NAN);
+          id(tomorrow_current_max_hourly_price_percentage).publish_state(NAN);
+          id(json_tomorrow_hourly_prices_kwh).publish_state("[]");
+          id(json_tomorrow_15min_prices_kwh_p1_00_00_07_45).publish_state("");
+          id(json_tomorrow_15min_prices_kwh_p2_08_00_15_45).publish_state("");
+          id(json_tomorrow_15min_prices_kwh_p3_16_00_23_45).publish_state("");
+          id(tomorrow_min_price_time_str) = "--:--";
+          id(tomorrow_max_price_time_str) = "--:--";
+          id(tomorrow_min_hourly_price_time_str) = "--:--";
+          id(tomorrow_max_hourly_price_time_str) = "--:--";
+          id(tomorrow_last_update_success) = false;
+          id(tomorrow_update_status_message) = "Cleared – awaiting next 13:20 window";
+          id(tomorrow_current_price_status_str) = "Cleared";
+          id(tomorrow_price_update_status).update();
+          id(tomorrow_price_status_message).update();
+          id(tomorrow_current_price_status).update();
+          id(tomorrow_nvs_status).publish_state("Cleared");
+          id(tomorrow_last_api_fetch_time) = std::string("Never");
+          id(tomorrow_last_api_fetch_time_sensor).publish_state("Never");
+          id(tomorrow_last_price_update_time).publish_state("Outside fetch window");
