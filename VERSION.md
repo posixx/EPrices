@@ -1,5 +1,40 @@
 # EPrices – Version History
 
+## v1.2 — 2026-04-06
+
+### HTTP fetch stuck-flag watchdog
+
+Fixed a production-observed reliability issue where a TCP-level stall during
+an HTTP fetch could lock `is_updating_today` or `is_updating_tomorrow` at
+`true` for several minutes, silently blocking all auto-retry triggers and
+manual button presses for the duration.
+
+A 120-second watchdog was added to both worker loops. If either `is_updating_*`
+flag has been held for more than 120 seconds, the worker force-clears it and
+sets the status message to `"Fetch timeout – will retry"`, allowing the next
+scheduled retry or manual press to proceed immediately.
+
+New globals: `is_updating_today_since`, `is_updating_tomorrow_since`.
+
+### Tomorrow auto-retry attempt counter fix
+
+`tomorrow_retry_count` was not being incremented in the 13:55 and 14:55–19:55
+hourly retry triggers, causing the `Tomorrow API Fetch Attempts` diagnostic
+sensor to undercount after the first scheduled attempt at 13:25.
+
+### Status message improvements
+
+- `tomorrow_update_status_message` initial value changed from
+  `"Waiting for 13:20"` to `"No data yet"` — removes misleading time
+  reference shown after afternoon reboots
+- `clear_tomorrow_prices` end message changed from
+  `"Cleared – awaiting next 13:20 window"` to
+  `"Cleared – awaiting fetch window"`
+
+See `CHANGELOG.md` for full implementation details.
+
+---
+
 ## v1.1 — 2026-04-06
 
 ### Negative price provider fee
