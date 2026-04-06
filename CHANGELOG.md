@@ -1,5 +1,70 @@
 # EPrices – Changelog
 
+## v1.2 — 2026-04-06
+
+### HTTP fetch stuck-flag watchdog
+
+Fixed a reliability issue where an HTTP fetch that stalled at the TCP level
+(connection accepted by the server but data delivery suspended) could hold
+`is_updating_today` or `is_updating_tomorrow` locked at `true` indefinitely.
+While the flag was stuck, all subsequent auto-retry triggers and manual button
+presses were silently blocked.
+
+**Root cause:** The application-level 25 s HTTP timeout does not fire when the
+TCP connection is established but the server stops sending data mid-transfer.
+The socket never goes idle from the OS perspective, so the timeout never
+triggers, and the fetch hangs until the TCP stack eventually resets the
+connection — which can take several minutes.
+
+**Fix:** Added a 120-second watchdog to both the today and tomorrow worker
+loops (`seconds: /10`). If `is_updating_*` has been `true` for more than 120
+seconds, the worker force-clears the flag and sets the status message to
+`"Fetch timeout – will retry"`. The next scheduled retry or manual press then
+proceeds normally.
+
+**New globals:**
+- `is_updating_today_since` (`time_t`) — timestamp when `is_updating_today` was last set to `true`
+- `is_updating_tomorrow_since` (`time_t`) — timestamp when `is_updating_tomorrow` was last set to `true`
+
+Both timestamps are set immediately alongside `is_updating_* = true` inside
+`smart_price_update` and `smart_tomorrow_price_update`.
+
+**Changed locations in `eprices.yaml`:**
+- `globals:` — added `is_updating_today_since` and `is_updating_tomorrow_since`
+- `smart_price_update` script — added `id(is_updating_today_since) = ...` alongside flag set
+- `smart_tomorrow_price_update` script — added `id(is_updating_tomorrow_since) = ...` alongside flag set
+- Today worker (`seconds: /10`) — watchdog block added before existing worker logic
+- Tomorrow worker (`seconds: /10`) — watchdog block added before existing worker logic
+
+---
+
+### Tomorrow auto-retry attempt counter fix
+
+Fixed a bug where `tomorrow_retry_count` was not incremented in the 13:55 and
+14:55–19:55 hourly retry triggers. Those triggers called
+`smart_tomorrow_price_update` directly without incrementing the counter first,
+causing the `Tomorrow API Fetch Attempts` diagnostic sensor to undercount
+attempts after the first one at 13:25.
+
+**Changed locations in `eprices.yaml`:**
+- 13:55 trigger — added `id(tomorrow_retry_count)++` before `.execute()`
+- 14:55–19:55 hourly trigger — added `id(tomorrow_retry_count)++` before `.execute()`
+
+---
+
+### Status message improvements
+
+Two status message strings that contained a hardcoded time reference have been
+corrected. Both were misleading after a device reboot in the afternoon or a
+manual `clear_tomorrow_prices` call outside the normal fetch window.
+
+| Location | Old value | New value |
+|---|---|---|
+| `tomorrow_update_status_message` global `initial_value` | `"Waiting for 13:20"` | `"No data yet"` |
+| `clear_tomorrow_prices` script end | `"Cleared – awaiting next 13:20 window"` | `"Cleared – awaiting fetch window"` |
+
+---
+
 ## v1.1 — 2026-04-06
 
 ### Negative price provider fee support
