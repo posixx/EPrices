@@ -1,10 +1,25 @@
 # =============================================================================
-# ESPHome: EPrices v1.1
+# ESPHome: EPrices v1.2
 #
 # Electricity price data provided by Energy-Charts (https://energy-charts.info)
 # under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).
 #
-# v1.1 changes:
+# v1.2 changes (2026-04-06):
+# - HTTP fetch stuck-flag watchdog (120 s) added to today and tomorrow workers:
+#   if is_updating_today / is_updating_tomorrow stays true for >120 s (TCP
+#   stall not caught by app-level timeout), the flag is force-cleared and
+#   status message set to "Fetch timeout – will retry"
+# - New globals: is_updating_today_since, is_updating_tomorrow_since
+#   set alongside is_updating_* = true in smart_price_update and
+#   smart_tomorrow_price_update
+# - tomorrow_retry_count++ added before .execute() in 13:55 and 14:55–19:55
+#   hourly retry triggers (counter was not incrementing after attempt #1)
+# - tomorrow_update_status_message initial_value: "Waiting for 13:20"
+#   → "No data yet" (removes misleading time reference after afternoon reboot)
+# - clear_tomorrow_prices end message: "Cleared – awaiting next 13:20 window"
+#   → "Cleared – awaiting fetch window"
+#
+# v1.1 changes (2026-04-06):
 # - Separate provider fee for negative spot prices (eprices_neg_prov_fee):
 #   positive prices: (raw / 1000) × (1 + prov_fee)     × (1 + vat_rate)
 #   negative prices: (raw / 1000) × (1 - neg_prov_fee) × (1 + vat_rate)
@@ -42,6 +57,7 @@
 #   eprices_country_bzn           e.g. "SI"
 #   eprices_prov_fee              e.g. "0.12"  (provider fee, decimal multiplier)
 #   eprices_vat_rate              e.g. "0.22"  (VAT rate, decimal multiplier)
+#   eprices_neg_prov_fee          e.g. "0.30"  (neg price provider fee, decimal multiplier)
 #
 # See README.md for full installation instructions and sensor reference.
 # See CHANGELOG.md for complete sensor and entity ID listing.
@@ -185,6 +201,15 @@ time:
       - seconds: /10
         then:
           - lambda: |-
+              if (id(is_updating_today) && id(is_updating_today_since) > 0) {
+                time_t now_ts = (time_t)id(ha_time).now().timestamp;
+                if (now_ts - id(is_updating_today_since) > 120) {
+                  ESP_LOGW("eprices", "Worker: is_updating_today stuck >120s, force-clearing");
+                  id(is_updating_today) = false;
+                  id(is_updating_today_since) = 0;
+                  id(update_status_message) = "Fetch timeout – will retry";
+                }
+              }
               if (id(need_today_update) && !id(is_updating_today)) {
                 ESP_LOGI("eprices", "Worker: starting Today update");
                 id(need_today_update) = false;
@@ -194,6 +219,15 @@ time:
       - seconds: /10
         then:
           - lambda: |-
+              if (id(is_updating_tomorrow) && id(is_updating_tomorrow_since) > 0) {
+                time_t now_ts = (time_t)id(ha_time).now().timestamp;
+                if (now_ts - id(is_updating_tomorrow_since) > 120) {
+                  ESP_LOGW("eprices", "Worker: is_updating_tomorrow stuck >120s, force-clearing");
+                  id(is_updating_tomorrow) = false;
+                  id(is_updating_tomorrow_since) = 0;
+                  id(tomorrow_update_status_message) = "Fetch timeout – will retry";
+                }
+              }
               auto t = id(ha_time).now();
               bool in_window = (t.hour > 13 && t.hour < 23) ||
                                (t.hour == 13 && t.minute >= 20) ||
@@ -322,7 +356,8 @@ time:
                 return;
               }
 
-              ESP_LOGW("eprices", "Auto tomorrow: attempt #%d at 13:55", id(tomorrow_retry_count) + 1);
+              id(tomorrow_retry_count)++;
+              ESP_LOGW("eprices", "Auto tomorrow: attempt #%d at 13:55", id(tomorrow_retry_count));
               id(smart_tomorrow_price_update).execute();
 
       # Attempts #3.. at 14:55, 15:55, 16:55, 17:55, 18:55, 19:55 (capped to 8)
@@ -343,7 +378,8 @@ time:
                 return;
               }
 
-              ESP_LOGW("eprices", "Auto tomorrow: attempt #%d at %02d:55", id(tomorrow_retry_count) + 1, t.hour);
+              id(tomorrow_retry_count)++;
+              ESP_LOGW("eprices", "Auto tomorrow: attempt #%d at %02d:55", id(tomorrow_retry_count), t.hour);
               id(smart_tomorrow_price_update).execute();
 
       - minutes: /1
@@ -462,6 +498,9 @@ globals:
   - id: is_updating_today
     type: bool
     initial_value: 'false'
+  - id: is_updating_today_since
+    type: time_t
+    initial_value: '0'
 
   - id: tomorrow_last_successful_update
     type: time_t
@@ -478,7 +517,7 @@ globals:
     initial_value: 'false'
   - id: tomorrow_update_status_message
     type: std::string
-    initial_value: '"Waiting for 13:20"'
+    initial_value: '"No data yet"'
   - id: tomorrow_retry_count
     type: int
     initial_value: '0'
@@ -494,6 +533,9 @@ globals:
   - id: is_updating_tomorrow
     type: bool
     initial_value: 'false'
+  - id: is_updating_tomorrow_since
+    type: time_t
+    initial_value: '0'
 
   # --- Country code for Energy-Charts API (wired from secret) ---
   - id: country_bzn
@@ -1769,6 +1811,7 @@ script:
             return;
           }
           id(is_updating_today) = true;
+          id(is_updating_today_since) = (time_t)id(ha_time).now().timestamp;
           id(last_update_attempt) = id(ha_time).now().timestamp;
           id(retry_count)++;
           { char buf[8]; snprintf(buf, sizeof(buf), "%d", id(retry_count)); id(today_price_update_attempts).publish_state(buf); }
@@ -1872,6 +1915,7 @@ script:
             return;
           }
           id(is_updating_tomorrow) = true;
+          id(is_updating_tomorrow_since) = (time_t)id(ha_time).now().timestamp;
           id(tomorrow_last_update_attempt) = id(ha_time).now().timestamp;
           id(tomorrow_retry_count)++;
           { char buf[8]; snprintf(buf, sizeof(buf), "%d", id(tomorrow_retry_count)); id(tomorrow_price_update_attempts).publish_state(buf); }
@@ -2101,7 +2145,7 @@ script:
           id(tomorrow_min_hourly_price_time_str) = "--:--";
           id(tomorrow_max_hourly_price_time_str) = "--:--";
           id(tomorrow_last_update_success) = false;
-          id(tomorrow_update_status_message) = "Cleared – awaiting next 13:20 window";
+          id(tomorrow_update_status_message) = "Cleared – awaiting fetch window";
           id(tomorrow_current_price_status_str) = "Cleared";
           id(tomorrow_price_update_status).update();
           id(tomorrow_price_status_message).update();
