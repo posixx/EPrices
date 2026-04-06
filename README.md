@@ -16,7 +16,8 @@ Assistant automations are required for any core functionality.
 ## Features
 
 - Fetches **15-minute resolution** spot prices for **today** and **tomorrow**
-- Automatically applies your **provider fee** and **VAT rate** to raw €/MWh prices
+- Automatically applies your **provider fee** and **VAT rate** to raw €/MWh prices —
+  with **separate fee configuration for negative spot prices**
 - Exposes **96 per-day price points** plus **24-hour averages** as JSON text sensors
   for use in HA automations and dashboards
 - **NVS persistence** — prices survive device reboots without re-fetching
@@ -28,7 +29,7 @@ Assistant automations are required for any core functionality.
 - Supports **any Energy-Charts bidding zone** (SI, DE-LU, AT, FR, HR, HU and more)
 - Full **diagnostic sensor suite** — NVS status, fetch attempts, API fetch times,
   data loaded times, WiFi signal, human-readable uptime
-- Provider fee and VAT rate configurable via `secrets.yaml` — **no code changes needed**
+- All fee and VAT settings configurable via `secrets.yaml` — **no code changes needed**
 
 ---
 
@@ -46,7 +47,7 @@ Assistant automations are required for any core functionality.
 | `eprices.yaml` | Main ESPHome configuration |
 | `eprices_nvs.h` | NVS helper — save/load price arrays to ESP32 flash |
 | `secrets.yaml` | Your local secrets (not committed to git) |
-| `CHANGELOG.md` | Complete sensor and entity ID reference for v1.0 |
+| `CHANGELOG.md` | Complete sensor and entity ID reference |
 | `VERSION.md` | Version history and release notes |
 | `ENTSO-E-PRICES-MIGRATION.md` | Optional — migration guide from the predecessor project |
 
@@ -71,6 +72,7 @@ eprices_timezone: "Europe/Ljubljana"
 eprices_country_bzn: "SI"
 eprices_prov_fee: "0.12"
 eprices_vat_rate: "0.22"
+eprices_neg_prov_fee: "0.30"
 ```
 
 **Key descriptions:**
@@ -79,8 +81,9 @@ eprices_vat_rate: "0.22"
 |---|---|
 | `eprices_timezone` | Your local timezone — must match a valid [IANA tz name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) |
 | `eprices_country_bzn` | Energy-Charts bidding zone code — see [supported zones](#supported-bidding-zones) |
-| `eprices_prov_fee` | Provider fee as a decimal multiplier, e.g. `"0.12"` = 12% |
-| `eprices_vat_rate` | VAT rate as a decimal multiplier, e.g. `"0.22"` = 22% |
+| `eprices_prov_fee` | Provider fee for **positive** spot prices — decimal multiplier, e.g. `"0.12"` = 12% |
+| `eprices_vat_rate` | VAT rate — decimal multiplier, e.g. `"0.22"` = 22% |
+| `eprices_neg_prov_fee` | Provider fee kept on **negative** spot prices — decimal multiplier, e.g. `"0.30"` means provider keeps 30%, pays you 70%; use `"0.00"` if provider passes the full negative price to you |
 | `eprices_api_encryption_key` | 32-byte base64 key for HA API encryption — generate with `openssl rand -base64 32` |
 
 ### 3) Flash to your ESP32
@@ -133,11 +136,22 @@ For the full list see the [Energy-Charts API documentation](https://api.energy-c
 ### Price calculation
 
 Raw prices from the API are in **€/MWh**. EPrices converts them to **€/kWh**
-and applies your provider fee and VAT:
+and applies your provider fee and VAT. Positive and negative spot prices use
+separate fee multipliers, configurable independently in `secrets.yaml`:
 
-```
-price_eur_kwh = (raw_eur_mwh / 1000) × (1 + prov_fee) × (1 + vat_rate)
-```
+| Market price | Formula |
+|---|---|
+| Positive (`raw ≥ 0`) | `(raw / 1000) × (1 + prov_fee) × (1 + vat_rate)` |
+| Negative (`raw < 0`) | `(raw / 1000) × (1 - neg_prov_fee) × (1 + vat_rate)` |
+
+The switch happens on the **raw API price** before any multiplier is applied.
+VAT is applied to both cases, consistent with net billing contracts where VAT
+is calculated on the monthly net sum (mathematically equivalent due to VAT
+being a linear multiplier).
+
+**Example with `prov_fee = 0.12`, `neg_prov_fee = 0.30`, `vat_rate = 0.22`:**
+- Spot price `+100 €/MWh` → `(100/1000) × 1.12 × 1.22` = **0.1366 €/kWh** (you pay)
+- Spot price `−50 €/MWh` → `(−50/1000) × 0.70 × 1.22` = **−0.0427 €/kWh** (you receive)
 
 ### Negative prices
 
