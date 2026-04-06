@@ -1,5 +1,25 @@
 # EPrices – Version History
 
+## v1.1 — 2026-04-06
+
+### Negative price provider fee
+
+Added separate provider fee support for negative spot prices via a new
+`eprices_neg_prov_fee` secret key. Positive and negative market prices
+now use independent fee multipliers, correctly modelling contracts where
+the provider's fee structure differs between the two cases.
+
+Price calculation:
+- Positive: `(raw / 1000) × (1 + prov_fee) × (1 + vat_rate)`
+- Negative: `(raw / 1000) × (1 - neg_prov_fee) × (1 + vat_rate)`
+
+VAT is applied to both, consistent with net billing where VAT is calculated
+on the monthly net sum (linear equivalence applies).
+
+See `CHANGELOG.md` for full implementation details.
+
+---
+
 ## v1.0 — 2026-04-05
 
 First public release.
