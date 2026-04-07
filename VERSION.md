@@ -1,5 +1,35 @@
 # EPrices – Version History
 
+## v1.2.1 — 2026-04-07
+
+Stability and housekeeping patch. No new sensors, no secrets changes,
+no entity ID changes. Drop-in replacement for v1.2.
+
+### ESP32 main task stack size increase
+
+Doubled the FreeRTOS main task stack from 8192 to 16384 bytes via
+`CONFIG_ESP_MAIN_TASK_STACK_SIZE`. Eliminates the stack overflow scenario
+most likely responsible for the spontaneous reboot observed in production
+on 2026-04-06 during a simultaneous NVS load + HTTP fetch/parse cycle.
+
+### Price vector heap pre-allocation at boot
+
+Added `.reserve(96)` on all four price vectors (`price_timestamps_today`,
+`price_values_today`, `price_timestamps_tomorrow`, `price_values_tomorrow`)
+in the `on_boot` lambda. Prevents repeated heap reallocation during NVS load
+and HTTP parse operations, reducing heap fragmentation and peak allocation
+pressure during the boot sequence.
+
+### Hourly JSON sensor cleared state unified
+
+`Today JSON Hourly Prices EUR⁄kWh` and `Tomorrow JSON Hourly Prices EUR⁄kWh`
+now publish `""` when cleared, matching the existing behaviour of all six
+15-minute JSON sensors. Previously they published `"[]"`.
+
+See `CHANGELOG.md` for full implementation details.
+
+---
+
 ## v1.2 — 2026-04-06
 
 ### HTTP fetch stuck-flag watchdog
@@ -25,8 +55,7 @@ sensor to undercount after the first scheduled attempt at 13:25.
 ### Status message improvements
 
 - `tomorrow_update_status_message` initial value changed from
-  `"Waiting for 13:20"` to `"No data yet"` — removes misleading time
-  reference shown after afternoon reboots
+  `"Waiting for 13:20"` to `"No data yet"`
 - `clear_tomorrow_prices` end message changed from
   `"Cleared – awaiting next 13:20 window"` to
   `"Cleared – awaiting fetch window"`
