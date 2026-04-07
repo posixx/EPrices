@@ -1,5 +1,65 @@
 # EPrices – Changelog
 
+## v1.2.1 — 2026-04-07
+
+### ESP32 main task stack size increase
+
+Increased the FreeRTOS main application task stack from the ESP-IDF default
+of 8192 bytes to 16384 bytes. This eliminates the stack overflow scenario
+that most likely caused the spontaneous reboot observed in production on
+2026-04-06, where the FreeRTOS idle task faulted following memory pressure
+during a simultaneous NVS load and HTTP fetch/parse cycle.
+
+The 8 KB cost is well within the ESP32's 320 KB available RAM.
+
+**Changed location in `eprices.yaml`:**
+- `esp32: framework: sdkconfig_options:` — added
+  `CONFIG_ESP_MAIN_TASK_STACK_SIZE: "16384"`
+
+---
+
+### Price vector heap pre-allocation at boot
+
+Pre-allocated capacity for all four price vectors at boot using `.reserve(96)`.
+Previously, each vector started empty and grew incrementally on every NVS load
+and HTTP fetch, triggering repeated heap reallocations and leaving the heap
+fragmented before the first fetch cycle completed.
+
+With capacity reserved upfront, no reallocation occurs during any subsequent
+NVS load or HTTP parse operation. This reduces heap fragmentation and peak
+allocation spikes, particularly during the boot sequence where NVS load and
+the first HTTP fetch can overlap.
+
+**Vectors pre-allocated:**
+- `price_timestamps_today`
+- `price_values_today`
+- `price_timestamps_tomorrow`
+- `price_values_tomorrow`
+
+**Changed location in `eprices.yaml`:**
+- `on_boot:` lambda — added `.reserve(96)` on all four price vectors
+
+---
+
+### Hourly JSON sensor cleared state unified with 15-min sensors
+
+The two hourly JSON text sensors previously published `"[]"` when cleared
+(at midnight bridge and on `clear_today_prices` / `clear_tomorrow_prices`).
+The six 15-minute JSON sensors already published `""` in the same situation.
+All eight JSON sensors now publish `""` when cleared, giving consistent
+behaviour across the full sensor set.
+
+**Affected sensors:**
+- `Today JSON Hourly Prices EUR⁄kWh`
+- `Tomorrow JSON Hourly Prices EUR⁄kWh`
+
+**Changed locations in `eprices.yaml`:**
+- `clear_today_prices` script — `"[]"` → `""`
+- `clear_tomorrow_prices` script — `"[]"` → `""`
+- `midnight_bridge_promotion` script — `"[]"` → `""` (where applicable)
+
+---
+
 ## v1.2 — 2026-04-06
 
 ### HTTP fetch stuck-flag watchdog
@@ -179,10 +239,10 @@ eprices_vat_rate          # e.g. "0.22"  (VAT rate as decimal multiplier)
 
 | Name | Entity ID | Notes |
 |---|---|---|
-| Today JSON Hourly Prices EUR⁄kWh | `sensor.eprices_today_json_hourly_prices_eur_kwh` | JSON array, 24 values |
-| Today JSON 15-Min Prices EUR⁄kWh (P1 00:00-07:45) | `sensor.eprices_today_json_15_min_prices_eur_kwh_p1_00_00_07_45` | JSON array, 32 values |
-| Today JSON 15-Min Prices EUR⁄kWh (P2 08:00-15:45) | `sensor.eprices_today_json_15_min_prices_eur_kwh_p2_08_00_15_45` | JSON array, 32 values |
-| Today JSON 15-Min Prices EUR⁄kWh (P3 16:00-23:45) | `sensor.eprices_today_json_15_min_prices_eur_kwh_p3_16_00_23_45` | JSON array, 32 values |
+| Today JSON Hourly Prices EUR⁄kWh | `sensor.eprices_today_json_hourly_prices_eur_kwh` | JSON array, 24 values; `""` when no data |
+| Today JSON 15-Min Prices EUR⁄kWh (P1 00:00-07:45) | `sensor.eprices_today_json_15_min_prices_eur_kwh_p1_00_00_07_45` | JSON array, 32 values; `""` when no data |
+| Today JSON 15-Min Prices EUR⁄kWh (P2 08:00-15:45) | `sensor.eprices_today_json_15_min_prices_eur_kwh_p2_08_00_15_45` | JSON array, 32 values; `""` when no data |
+| Today JSON 15-Min Prices EUR⁄kWh (P3 16:00-23:45) | `sensor.eprices_today_json_15_min_prices_eur_kwh_p3_16_00_23_45` | JSON array, 32 values; `""` when no data |
 | Today Highest Price Time | `sensor.eprices_today_highest_price_time` | HH:MM |
 | Today Lowest Price Time | `sensor.eprices_today_lowest_price_time` | HH:MM |
 | Today Highest Hourly Price Time | `sensor.eprices_today_highest_hourly_price_time` | HH:00 |
@@ -194,10 +254,10 @@ eprices_vat_rate          # e.g. "0.22"  (VAT rate as decimal multiplier)
 | Today Price Update Status Message | `sensor.eprices_today_price_update_status_message` | Detailed status string; diagnostic |
 | Today API Fetch Attempts | `sensor.eprices_today_api_fetch_attempts` | HTTP fetch count; resets at midnight; diagnostic |
 | Today Entry Count | `sensor.eprices_today_entry_count` | Number of stored price points; diagnostic |
-| Tomorrow JSON Hourly Prices EUR⁄kWh | `sensor.eprices_tomorrow_json_hourly_prices_eur_kwh` | JSON array, 24 values |
-| Tomorrow JSON 15-Min Prices EUR⁄kWh (P1 00:00-07:45) | `sensor.eprices_tomorrow_json_15_min_prices_eur_kwh_p1_00_00_07_45` | JSON array, 32 values |
-| Tomorrow JSON 15-Min Prices EUR⁄kWh (P2 08:00-15:45) | `sensor.eprices_tomorrow_json_15_min_prices_eur_kwh_p2_08_00_15_45` | JSON array, 32 values |
-| Tomorrow JSON 15-Min Prices EUR⁄kWh (P3 16:00-23:45) | `sensor.eprices_tomorrow_json_15_min_prices_eur_kwh_p3_16_00_23_45` | JSON array, 32 values |
+| Tomorrow JSON Hourly Prices EUR⁄kWh | `sensor.eprices_tomorrow_json_hourly_prices_eur_kwh` | JSON array, 24 values; `""` when no data |
+| Tomorrow JSON 15-Min Prices EUR⁄kWh (P1 00:00-07:45) | `sensor.eprices_tomorrow_json_15_min_prices_eur_kwh_p1_00_00_07_45` | JSON array, 32 values; `""` when no data |
+| Tomorrow JSON 15-Min Prices EUR⁄kWh (P2 08:00-15:45) | `sensor.eprices_tomorrow_json_15_min_prices_eur_kwh_p2_08_00_15_45` | JSON array, 32 values; `""` when no data |
+| Tomorrow JSON 15-Min Prices EUR⁄kWh (P3 16:00-23:45) | `sensor.eprices_tomorrow_json_15_min_prices_eur_kwh_p3_16_00_23_45` | JSON array, 32 values; `""` when no data |
 | Tomorrow Highest Price Time | `sensor.eprices_tomorrow_highest_price_time` | HH:MM |
 | Tomorrow Lowest Price Time | `sensor.eprices_tomorrow_lowest_price_time` | HH:MM |
 | Tomorrow Highest Hourly Price Time | `sensor.eprices_tomorrow_highest_hourly_price_time` | HH:00 |
@@ -238,3 +298,4 @@ eprices_vat_rate          # e.g. "0.22"  (VAT rate as decimal multiplier)
 - **API fetch times** reset to `Never` at midnight bridge and on `clear_tomorrow_prices`
 - **API fetch attempt counters** reset to `0` at midnight and publish `0` immediately on boot
 - **Uptime** displayed as human-readable string: `45 s` / `5 min` / `3 h 22 min` / `12 d 4 h` / `4 months 12 d`
+- **JSON sensors** publish `""` (empty string) when no data is available — all eight JSON sensors behave consistently
