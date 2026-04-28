@@ -1,5 +1,44 @@
 # EPrices – Version History
 
+## v1.2.2 — 2026-04-28
+
+Stability patch addressing spontaneous reboots during tomorrow price fetch at ~13:55.
+No new sensors, no secrets changes, no entity ID changes. Drop-in replacement for v1.2.1.
+
+### ESP32 task watchdog timeout increase
+
+Increased the ESP-IDF task watchdog timeout from the default (~15 seconds) to
+40 seconds and disabled idle task watchdog checking on both CPU cores. This
+prevents false-positive watchdog resets during heavy JSON parsing when full price
+data arrives (~13:55 and subsequent retry attempts).
+
+**Root cause:** The first API call at 13:25 typically returns no data
+(Energy-Charts usually hasn't published tomorrow's prices yet), so no heavy
+parsing occurs. By 13:55, complete data is available, triggering the full
+parsing chain that exceeded the default watchdog timeout.
+
+### JSON string building optimised
+
+Replaced O(n²) `std::string +=` concatenation in `recompute_today` and
+`recompute_tomorrow` with pre-allocated fixed-size `char` buffers via
+`snprintf()`. Eliminates heap fragmentation and peak memory spikes during JSON
+building for the 8 JSON text sensors.
+
+### Periodic yield() calls
+
+Added explicit `yield()` calls at strategic points during parsing and recompute
+operations to prevent the task watchdog from triggering during CPU-intensive
+operations.
+
+### Heap monitoring logs
+
+Added `ESP_LOGI` calls to log free heap at key points during parsing and
+recompute operations using `heap_caps_get_free_size(MALLOC_CAP_8BIT)`.
+
+See `CHANGELOG.md` for full implementation details.
+
+---
+
 ## v1.2.1 — 2026-04-07
 
 Stability and housekeeping patch. No new sensors, no secrets changes,
