@@ -76,14 +76,15 @@
 # - All core logic on-device: no external HA automations required
 #
 # secrets.yaml keys required:
-#   wifi_ssid, wifi_password
-#   eprices_fallback_ap_ssid, eprices_fallback_ap_password
-#   eprices_api_encryption_key    (base64, generate: openssl rand -base64 32)
+#   hass_enc_key                  (base64, generate: openssl rand -base64 32)
 #   eprices_timezone              e.g. "Europe/Ljubljana"
 #   eprices_country_bzn           e.g. "SI"
-#   eprices_prov_fee              e.g. "0.12"  (provider fee, decimal multiplier)
+#   eprices_prov_fee              e.g. "0.12"  (percent mode: decimal fraction; surcharge mode: €/kWh)
 #   eprices_vat_rate              e.g. "0.22"  (VAT rate, decimal multiplier)
-#   eprices_neg_prov_fee          e.g. "0.30"  (neg price provider fee, decimal multiplier)
+#   eprices_neg_prov_fee          e.g. "0.30"  (percent mode: decimal fraction; surcharge mode: €/kWh)
+#   eprices_prov_fee_mode         "percent" (raw × (1+prov_fee) × (1+vat_rate))
+#                                 or "surcharge" (NL: (raw × (1+vat_rate)) ± prov_fee)
+#   eprices_energy_tax            e.g. "0.1031" (NL energiebelasting €/kWh; "0" to disable)
 #
 # See README.md for full installation instructions and sensor reference.
 # See CHANGELOG.md for complete sensor and entity ID listing.
@@ -95,12 +96,25 @@ substitutions:
   prov_fee_value:       !secret eprices_prov_fee
   vat_rate_value:       !secret eprices_vat_rate
   neg_prov_fee_value:   !secret eprices_neg_prov_fee
+  # "percent"   → fees are decimal fractions of the market price (e.g. 0.12 = +12%)
+  #               positive: (raw/1000) × (1 + prov_fee)     × (1 + vat_rate) + energy_tax
+  #               negative: (raw/1000) × (1 − neg_prov_fee) × (1 + vat_rate) + energy_tax
+  # "surcharge" → fees are fixed €/kWh amounts added/subtracted after VAT
+  #               positive: (raw/1000) × (1 + vat_rate) + prov_fee + energy_tax
+  #               negative: (raw/1000) × (1 + vat_rate) − neg_prov_fee + energy_tax
+  prov_fee_mode_value:  !secret eprices_prov_fee_mode
+  # NL energiebelasting (€/kWh, fixed). Added to BOTH positive and negative
+  # prices so the chart reflects "what it costs me" under saldering, where
+  # the per-kWh tax effectively nets out across consumption/feed-in.
+  # Set to "0" to disable.
+  energy_tax_value:     !secret eprices_energy_tax
 
 esphome:
   name: eprices
   friendly_name: EPrices
   includes:
     - eprices_nvs.h
+    - eprices_periods.h
   on_boot:
     priority: -100
     then:
@@ -120,11 +134,21 @@ esphome:
           id(price_values_tomorrow).reserve(96);
           // Log available heap for debugging
           ESP_LOGI("eprices", "Boot: free heap = %u bytes", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+          // Publish configured energy tax rate as a diagnostic sensor
+          // so dashboards/charts can read the current value without hardcoding.
+          id(energy_tax_rate_sensor).publish_state((float)id(energy_tax));
 
 esp32:
-  board: esp32dev
+  board: esp32-poe-iso
   framework:
     type: esp-idf
+    advanced:
+      # Target ESP32 rev 3.1 silicon (Olimex POE-ISO ships with rev 3.x);
+      # lets the toolchain drop legacy revision workarounds → smaller binary.
+      minimum_chip_revision: "3.1"
+      # Use the 40 KB SRAM1 region as additional IRAM; the rev 3.x bootloader
+      # supports this and it gives extra room for hot code paths.
+      sram1_as_iram: true
     sdkconfig_options:
       CONFIG_ESP_MAIN_TASK_STACK_SIZE: "16384"
       # v1.2.2: Increase watchdog timeout to prevent false positives during
@@ -136,14 +160,16 @@ esp32:
     # No include_builtin_idf_components needed — nvs headers are always
     # available in esp-idf framework; eprices_nvs.h includes them directly.
 
-captive_portal:
-
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  ap:
-    ssid: !secret eprices_fallback_ap_ssid
-    password: !secret eprices_fallback_ap_password
+# Olimex ESP32-POE-ISO: wired Ethernet via LAN8720 PHY (no WiFi)
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  phy_addr: 0
+  power_pin: GPIO12
+  clk:
+    mode: CLK_OUT
+    pin: GPIO17
 
 logger:
   level: INFO
@@ -164,7 +190,7 @@ http_request:
 # =============================================================================
 api:
   encryption:
-    key: !secret eprices_api_encryption_key
+    key: !secret hass_enc_key
   actions:
     - action: verify_price_update
       supports_response: only
@@ -594,6 +620,12 @@ globals:
   - id: neg_prov_fee
     type: double
     initial_value: '${neg_prov_fee_value}'
+  - id: prov_fee_mode
+    type: std::string
+    initial_value: '"${prov_fee_mode_value}"'
+  - id: energy_tax
+    type: double
+    initial_value: '${energy_tax_value}'
 
   # --- Pre-computed fetch URLs (url: !lambda not supported in scripts) ---
   - id: fetch_url_today
@@ -611,6 +643,58 @@ globals:
   - id: auto_today_retry_count
     type: int
     initial_value: '0'
+
+  # --- Period detection (cheapest / priciest 3-5h windows) – today ---
+  - id: cheap1_start
+    type: int
+    initial_value: '-1'
+  - id: cheap1_end
+    type: int
+    initial_value: '-1'
+  - id: cheap2_start
+    type: int
+    initial_value: '-1'
+  - id: cheap2_end
+    type: int
+    initial_value: '-1'
+  - id: expensive1_start
+    type: int
+    initial_value: '-1'
+  - id: expensive1_end
+    type: int
+    initial_value: '-1'
+  - id: expensive2_start
+    type: int
+    initial_value: '-1'
+  - id: expensive2_end
+    type: int
+    initial_value: '-1'
+
+  # --- Period detection (cheapest / priciest 3-5h windows) – tomorrow ---
+  - id: tomorrow_cheap1_start
+    type: int
+    initial_value: '-1'
+  - id: tomorrow_cheap1_end
+    type: int
+    initial_value: '-1'
+  - id: tomorrow_cheap2_start
+    type: int
+    initial_value: '-1'
+  - id: tomorrow_cheap2_end
+    type: int
+    initial_value: '-1'
+  - id: tomorrow_expensive1_start
+    type: int
+    initial_value: '-1'
+  - id: tomorrow_expensive1_end
+    type: int
+    initial_value: '-1'
+  - id: tomorrow_expensive2_start
+    type: int
+    initial_value: '-1'
+  - id: tomorrow_expensive2_end
+    type: int
+    initial_value: '-1'
 
 # =============================================================================
 # SENSORS – TODAY
@@ -848,11 +932,14 @@ sensor:
 # =============================================================================
 # SENSORS – SYSTEM DIAGNOSTIC
 # =============================================================================
-  - platform: wifi_signal
-    name: "WiFi Signal"
-    id: wifi_signal_sensor
-    update_interval: 60s
+  - platform: template
+    name: "Energy Tax Rate"
+    id: energy_tax_rate_sensor
+    unit_of_measurement: "€/kWh"
+    accuracy_decimals: 4
+    icon: "mdi:cash-multiple"
     entity_category: "diagnostic"
+    update_interval: never
 
   - platform: uptime
     name: "Uptime"
@@ -984,6 +1071,18 @@ text_sensor:
       snprintf(buf, sizeof(buf), "%d", id(today_entry_count));
       return std::string(buf);
 
+  - platform: template
+    name: "Today Cheapest Period Times"
+    id: cheapest_period_times
+    icon: "mdi:clock-minus-outline"
+    update_interval: never
+
+  - platform: template
+    name: "Today Priciest Period Times"
+    id: priciest_period_times
+    icon: "mdi:clock-plus-outline"
+    update_interval: never
+
 # =============================================================================
 # TEXT SENSORS – TOMORROW
 # =============================================================================
@@ -1080,6 +1179,18 @@ text_sensor:
       char buf[8];
       snprintf(buf, sizeof(buf), "%d", id(tomorrow_entry_count));
       return std::string(buf);
+
+  - platform: template
+    name: "Tomorrow Cheapest Period Times"
+    id: tomorrow_cheapest_period_times
+    icon: "mdi:clock-minus-outline"
+    update_interval: never
+
+  - platform: template
+    name: "Tomorrow Priciest Period Times"
+    id: tomorrow_priciest_period_times
+    icon: "mdi:clock-plus-outline"
+    update_interval: never
 
 # =============================================================================
 # TEXT SENSORS – DIAGNOSTIC
@@ -1183,6 +1294,58 @@ text_sensor:
     icon: "mdi:timer-outline"
     entity_category: "diagnostic"
     update_interval: never
+
+# =============================================================================
+# BINARY SENSORS – cheapest / priciest hour windows
+# =============================================================================
+binary_sensor:
+  - platform: template
+    name: "Cheapest Hours"
+    id: cheapest_hours
+    icon: "mdi:cash-minus"
+    lambda: |-
+      int h = id(ha_time).now().hour;
+      int c1s = id(cheap1_start), c1e = id(cheap1_end);
+      int c2s = id(cheap2_start), c2e = id(cheap2_end);
+      if (c1s >= 0 && h >= c1s && h < c1e) return true;
+      if (c2s >= 0 && h >= c2s && h < c2e) return true;
+      return false;
+
+  - platform: template
+    name: "Priciest Hours"
+    id: priciest_hours
+    icon: "mdi:cash-plus"
+    lambda: |-
+      int h = id(ha_time).now().hour;
+      int e1s = id(expensive1_start), e1e = id(expensive1_end);
+      int e2s = id(expensive2_start), e2e = id(expensive2_end);
+      if (e1s >= 0 && h >= e1s && h < e1e) return true;
+      if (e2s >= 0 && h >= e2s && h < e2e) return true;
+      return false;
+
+  - platform: template
+    name: "Tomorrow Cheapest Hours"
+    id: tomorrow_cheapest_hours
+    icon: "mdi:cash-minus"
+    lambda: |-
+      int h = id(ha_time).now().hour;
+      int c1s = id(tomorrow_cheap1_start), c1e = id(tomorrow_cheap1_end);
+      int c2s = id(tomorrow_cheap2_start), c2e = id(tomorrow_cheap2_end);
+      if (c1s >= 0 && h >= c1s && h < c1e) return true;
+      if (c2s >= 0 && h >= c2s && h < c2e) return true;
+      return false;
+
+  - platform: template
+    name: "Tomorrow Priciest Hours"
+    id: tomorrow_priciest_hours
+    icon: "mdi:cash-plus"
+    lambda: |-
+      int h = id(ha_time).now().hour;
+      int e1s = id(tomorrow_expensive1_start), e1e = id(tomorrow_expensive1_end);
+      int e2s = id(tomorrow_expensive2_start), e2e = id(tomorrow_expensive2_end);
+      if (e1s >= 0 && h >= e1s && h < e1e) return true;
+      if (e2s >= 0 && h >= e2s && h < e2e) return true;
+      return false;
 
 # =============================================================================
 # BUTTONS
@@ -1358,8 +1521,14 @@ script:
       raw_body: string
     then:
       - lambda: |-
-          const double MULT_POS = (1.0 + id(prov_fee))     * (1.0 + id(vat_rate));
-          const double MULT_NEG = (1.0 - id(neg_prov_fee)) * (1.0 + id(vat_rate));
+          const bool   SURCHARGE = (id(prov_fee_mode) == "surcharge");
+          const double VAT_MULT  = (1.0 + id(vat_rate));
+          const double MULT_POS  = (1.0 + id(prov_fee))     * VAT_MULT;
+          const double MULT_NEG  = (1.0 - id(neg_prov_fee)) * VAT_MULT;
+          const double ENERGY_TAX = id(energy_tax);
+          ESP_LOGI("eprices", "parse_today: mode=%s prov_fee=%.4f neg_prov_fee=%.4f vat_rate=%.4f energy_tax=%.4f",
+                   SURCHARGE ? "surcharge" : "percent",
+                   id(prov_fee), id(neg_prov_fee), id(vat_rate), ENERGY_TAX);
 
           id(price_values_today).clear();
           id(price_timestamps_today).clear();
@@ -1458,7 +1627,15 @@ script:
             if (end1 == ts_toks[i].c_str() || end2 == prc_toks[i].c_str()) continue;
             if (unix_ts <= 0) continue;
 
-            float eur_kwh = (float)((double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0);
+            double eur_kwh_d;
+            if (SURCHARGE) {
+              eur_kwh_d = ((double)raw_mwh / 1000.0) * VAT_MULT
+                          + (raw_mwh >= 0 ? id(prov_fee) : -id(neg_prov_fee));
+            } else {
+              eur_kwh_d = (double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0;
+            }
+            eur_kwh_d += ENERGY_TAX;
+            float eur_kwh = (float)eur_kwh_d;
             id(price_timestamps_today).push_back(unix_ts);
             id(price_values_today).push_back(eur_kwh);
 
@@ -1481,8 +1658,14 @@ script:
       raw_body: string
     then:
       - lambda: |-
-          const double MULT_POS = (1.0 + id(prov_fee))     * (1.0 + id(vat_rate));
-          const double MULT_NEG = (1.0 - id(neg_prov_fee)) * (1.0 + id(vat_rate));
+          const bool   SURCHARGE = (id(prov_fee_mode) == "surcharge");
+          const double VAT_MULT  = (1.0 + id(vat_rate));
+          const double MULT_POS  = (1.0 + id(prov_fee))     * VAT_MULT;
+          const double MULT_NEG  = (1.0 - id(neg_prov_fee)) * VAT_MULT;
+          const double ENERGY_TAX = id(energy_tax);
+          ESP_LOGI("eprices", "parse_tomorrow: mode=%s prov_fee=%.4f neg_prov_fee=%.4f vat_rate=%.4f energy_tax=%.4f",
+                   SURCHARGE ? "surcharge" : "percent",
+                   id(prov_fee), id(neg_prov_fee), id(vat_rate), ENERGY_TAX);
 
           id(price_values_tomorrow).clear();
           id(price_timestamps_tomorrow).clear();
@@ -1561,7 +1744,15 @@ script:
             if (end1 == ts_toks[i].c_str() || end2 == prc_toks[i].c_str()) continue;
             if (unix_ts <= 0) continue;
 
-            float eur_kwh = (float)((double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0);
+            double eur_kwh_d;
+            if (SURCHARGE) {
+              eur_kwh_d = ((double)raw_mwh / 1000.0) * VAT_MULT
+                          + (raw_mwh >= 0 ? id(prov_fee) : -id(neg_prov_fee));
+            } else {
+              eur_kwh_d = (double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0;
+            }
+            eur_kwh_d += ENERGY_TAX;
+            float eur_kwh = (float)eur_kwh_d;
             id(price_timestamps_tomorrow).push_back(unix_ts);
             id(price_values_tomorrow).push_back(eur_kwh);
 
@@ -1724,6 +1915,20 @@ script:
             id(current_price_status_str) = (cur >= 0) ? "Valid" : "Missing";
           }
 
+          // Period detection (cheapest & priciest 3-5h windows)
+          {
+            auto pr = eprices_periods::find_periods(id(hourly_avg_prices_kwh));
+            id(cheap1_start)     = pr.cheap1_start; id(cheap1_end)     = pr.cheap1_end;
+            id(cheap2_start)     = pr.cheap2_start; id(cheap2_end)     = pr.cheap2_end;
+            id(expensive1_start) = pr.exp1_start;   id(expensive1_end) = pr.exp1_end;
+            id(expensive2_start) = pr.exp2_start;   id(expensive2_end) = pr.exp2_end;
+            id(cheapest_period_times).publish_state(pr.cheap_txt);
+            id(priciest_period_times).publish_state(pr.exp_txt);
+            ESP_LOGI("eprices", "Today periods: cheap=[%d-%d, %d-%d] exp=[%d-%d, %d-%d]",
+                     pr.cheap1_start, pr.cheap1_end, pr.cheap2_start, pr.cheap2_end,
+                     pr.exp1_start, pr.exp1_end, pr.exp2_start, pr.exp2_end);
+          }
+
           // v1.2.2: Log heap at end
           ESP_LOGI("eprices", "recompute_today: done, free heap = %u bytes", heap_caps_get_free_size(MALLOC_CAP_8BIT));
 
@@ -1861,6 +2066,20 @@ script:
             if (id(price_timestamps_tomorrow)[j] <= ts_now_tomorrow) { cur = j; break; }
           id(tomorrow_current_price_status_str) = (cur >= 0) ? "Valid" : "Missing";
           id(tomorrow_last_update_attempt) = id(ha_time).now().timestamp;
+
+          // Period detection (cheapest & priciest 3-5h windows)
+          {
+            auto pr = eprices_periods::find_periods(id(tomorrow_hourly_avg_prices_kwh));
+            id(tomorrow_cheap1_start)     = pr.cheap1_start; id(tomorrow_cheap1_end)     = pr.cheap1_end;
+            id(tomorrow_cheap2_start)     = pr.cheap2_start; id(tomorrow_cheap2_end)     = pr.cheap2_end;
+            id(tomorrow_expensive1_start) = pr.exp1_start;   id(tomorrow_expensive1_end) = pr.exp1_end;
+            id(tomorrow_expensive2_start) = pr.exp2_start;   id(tomorrow_expensive2_end) = pr.exp2_end;
+            id(tomorrow_cheapest_period_times).publish_state(pr.cheap_txt);
+            id(tomorrow_priciest_period_times).publish_state(pr.exp_txt);
+            ESP_LOGI("eprices", "Tomorrow periods: cheap=[%d-%d, %d-%d] exp=[%d-%d, %d-%d]",
+                     pr.cheap1_start, pr.cheap1_end, pr.cheap2_start, pr.cheap2_end,
+                     pr.exp1_start, pr.exp1_end, pr.exp2_start, pr.exp2_end);
+          }
 
           // v1.2.2: Log heap at end
           ESP_LOGI("eprices", "recompute_tomorrow: done, free heap = %u bytes", heap_caps_get_free_size(MALLOC_CAP_8BIT));
@@ -2247,6 +2466,13 @@ script:
           id(today_price_status_message).update();
           id(current_price_status_str) = "Cleared";
           id(today_current_price_status).update();
+          // Reset period detection state
+          id(cheap1_start) = -1; id(cheap1_end) = -1;
+          id(cheap2_start) = -1; id(cheap2_end) = -1;
+          id(expensive1_start) = -1; id(expensive1_end) = -1;
+          id(expensive2_start) = -1; id(expensive2_end) = -1;
+          id(cheapest_period_times).publish_state("--");
+          id(priciest_period_times).publish_state("--");
 
   - id: clear_tomorrow_prices
     then:
@@ -2286,3 +2512,10 @@ script:
           id(tomorrow_last_api_fetch_time) = std::string("Never");
           id(tomorrow_last_api_fetch_time_sensor).publish_state("Never");
           id(tomorrow_last_price_update_time).publish_state("Outside fetch window");
+          // Reset period detection state
+          id(tomorrow_cheap1_start) = -1; id(tomorrow_cheap1_end) = -1;
+          id(tomorrow_cheap2_start) = -1; id(tomorrow_cheap2_end) = -1;
+          id(tomorrow_expensive1_start) = -1; id(tomorrow_expensive1_end) = -1;
+          id(tomorrow_expensive2_start) = -1; id(tomorrow_expensive2_end) = -1;
+          id(tomorrow_cheapest_period_times).publish_state("--");
+          id(tomorrow_priciest_period_times).publish_state("--");
