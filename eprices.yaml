@@ -84,7 +84,7 @@
 #   eprices_neg_prov_fee          e.g. "0.30"  (percent mode: decimal fraction; surcharge mode: €/kWh)
 #   eprices_prov_fee_mode         "percent" (raw × (1+prov_fee) × (1+vat_rate))
 #                                 or "surcharge" (NL: (raw × (1+vat_rate)) ± prov_fee)
-#   eprices_energy_tax            e.g. "0.1031" (NL energiebelasting €/kWh; "0" to disable)
+#   eprices_energy_tax            e.g. "0.1031" (NL energiebelasting €/kWh, EXCL. VAT; "0" to disable)
 #
 # See README.md for full installation instructions and sensor reference.
 # See CHANGELOG.md for complete sensor and entity ID listing.
@@ -97,16 +97,17 @@ substitutions:
   vat_rate_value:       !secret eprices_vat_rate
   neg_prov_fee_value:   !secret eprices_neg_prov_fee
   # "percent"   → fees are decimal fractions of the market price (e.g. 0.12 = +12%)
-  #               positive: (raw/1000) × (1 + prov_fee)     × (1 + vat_rate) + energy_tax
-  #               negative: (raw/1000) × (1 − neg_prov_fee) × (1 + vat_rate) + energy_tax
-  # "surcharge" → fees are fixed €/kWh amounts added/subtracted after VAT
-  #               positive: (raw/1000) × (1 + vat_rate) + prov_fee + energy_tax
-  #               negative: (raw/1000) × (1 + vat_rate) − neg_prov_fee + energy_tax
+  #               positive: (raw/1000) × (1 + prov_fee)     × (1 + vat_rate) + energy_tax × (1 + vat_rate)
+  #               negative: (raw/1000) × (1 − neg_prov_fee) × (1 + vat_rate) + energy_tax × (1 + vat_rate)
+  # "surcharge" → fees are fixed €/kWh amounts added/subtracted after VAT;
+  #               energy_tax is included in the pre-VAT subtotal
+  #               positive: ((raw/1000) + energy_tax) × (1 + vat_rate) + prov_fee
+  #               negative: ((raw/1000) + energy_tax) × (1 + vat_rate) − neg_prov_fee
   prov_fee_mode_value:  !secret eprices_prov_fee_mode
-  # NL energiebelasting (€/kWh, fixed). Added to BOTH positive and negative
-  # prices so the chart reflects "what it costs me" under saldering, where
-  # the per-kWh tax effectively nets out across consumption/feed-in.
-  # Set to "0" to disable.
+  # NL energiebelasting (€/kWh, fixed, EXCLUSIVE of VAT — VAT is applied by
+  # the parser). Added to BOTH positive and negative prices so the chart
+  # reflects "what it costs me" under saldering, where the per-kWh tax
+  # effectively nets out across consumption/feed-in. Set to "0" to disable.
   energy_tax_value:     !secret eprices_energy_tax
 
 esphome:
@@ -1566,12 +1567,14 @@ script:
 
             double eur_kwh_d;
             if (SURCHARGE) {
-              eur_kwh_d = ((double)raw_mwh / 1000.0) * VAT_MULT
+              // energy_tax sits in the pre-VAT subtotal; opslag is added after VAT
+              eur_kwh_d = ((double)raw_mwh / 1000.0 + ENERGY_TAX) * VAT_MULT
                           + (raw_mwh >= 0 ? id(prov_fee) : -id(neg_prov_fee));
             } else {
-              eur_kwh_d = (double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0;
+              // percent mode: opslag scales raw; energy_tax is also VAT-taxed
+              eur_kwh_d = (double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0
+                          + ENERGY_TAX * VAT_MULT;
             }
-            eur_kwh_d += ENERGY_TAX;
             float eur_kwh = (float)eur_kwh_d;
             id(price_timestamps_today).push_back(unix_ts);
             id(price_values_today).push_back(eur_kwh);
@@ -1683,12 +1686,14 @@ script:
 
             double eur_kwh_d;
             if (SURCHARGE) {
-              eur_kwh_d = ((double)raw_mwh / 1000.0) * VAT_MULT
+              // energy_tax sits in the pre-VAT subtotal; opslag is added after VAT
+              eur_kwh_d = ((double)raw_mwh / 1000.0 + ENERGY_TAX) * VAT_MULT
                           + (raw_mwh >= 0 ? id(prov_fee) : -id(neg_prov_fee));
             } else {
-              eur_kwh_d = (double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0;
+              // percent mode: opslag scales raw; energy_tax is also VAT-taxed
+              eur_kwh_d = (double)raw_mwh * (raw_mwh >= 0 ? MULT_POS : MULT_NEG) / 1000.0
+                          + ENERGY_TAX * VAT_MULT;
             }
-            eur_kwh_d += ENERGY_TAX;
             float eur_kwh = (float)eur_kwh_d;
             id(price_timestamps_tomorrow).push_back(unix_ts);
             id(price_values_tomorrow).push_back(eur_kwh);
