@@ -941,38 +941,6 @@ sensor:
     entity_category: "diagnostic"
     update_interval: never
 
-  - platform: uptime
-    name: "Uptime"
-    id: uptime_sensor
-    internal: true
-    update_interval: 60s
-    entity_category: "diagnostic"
-    on_raw_value:
-      then:
-        - lambda: |-
-            uint32_t s = (uint32_t)x;
-            char buf[32];
-            if (s < 120) {
-              snprintf(buf, sizeof(buf), "%u s", s);
-            } else if (s < 48 * 3600) {
-              uint32_t h = s / 3600;
-              uint32_t m = (s % 3600) / 60;
-              if (h < 2)
-                snprintf(buf, sizeof(buf), "%u min", s / 60);
-              else
-                snprintf(buf, sizeof(buf), "%u h %u min", h, m);
-            } else if (s < 90UL * 86400UL) {
-              uint32_t d = s / 86400;
-              uint32_t h = (s % 86400) / 3600;
-              snprintf(buf, sizeof(buf), "%u d %u h", d, h);
-            } else {
-              uint32_t d   = s / 86400;
-              uint32_t mo  = d / 30;
-              uint32_t rem = d % 30;
-              snprintf(buf, sizeof(buf), "%u months %u d", mo, rem);
-            }
-            id(uptime_text).publish_state(buf);
-
 # =============================================================================
 # TEXT SENSORS – TODAY
 # =============================================================================
@@ -1288,13 +1256,6 @@ text_sensor:
       snprintf(buf, sizeof(buf), "%d", id(tomorrow_retry_count));
       return std::string(buf);
 
-  - platform: template
-    name: "Uptime"
-    id: uptime_text
-    icon: "mdi:timer-outline"
-    entity_category: "diagnostic"
-    update_interval: never
-
 # =============================================================================
 # BINARY SENSORS – cheapest / priciest hour windows
 # =============================================================================
@@ -1319,30 +1280,6 @@ binary_sensor:
       int h = id(ha_time).now().hour;
       int e1s = id(expensive1_start), e1e = id(expensive1_end);
       int e2s = id(expensive2_start), e2e = id(expensive2_end);
-      if (e1s >= 0 && h >= e1s && h < e1e) return true;
-      if (e2s >= 0 && h >= e2s && h < e2e) return true;
-      return false;
-
-  - platform: template
-    name: "Tomorrow Cheapest Hours"
-    id: tomorrow_cheapest_hours
-    icon: "mdi:cash-minus"
-    lambda: |-
-      int h = id(ha_time).now().hour;
-      int c1s = id(tomorrow_cheap1_start), c1e = id(tomorrow_cheap1_end);
-      int c2s = id(tomorrow_cheap2_start), c2e = id(tomorrow_cheap2_end);
-      if (c1s >= 0 && h >= c1s && h < c1e) return true;
-      if (c2s >= 0 && h >= c2s && h < c2e) return true;
-      return false;
-
-  - platform: template
-    name: "Tomorrow Priciest Hours"
-    id: tomorrow_priciest_hours
-    icon: "mdi:cash-plus"
-    lambda: |-
-      int h = id(ha_time).now().hour;
-      int e1s = id(tomorrow_expensive1_start), e1e = id(tomorrow_expensive1_end);
-      int e2s = id(tomorrow_expensive2_start), e2e = id(tomorrow_expensive2_end);
       if (e1s >= 0 && h >= e1s && h < e1e) return true;
       if (e2s >= 0 && h >= e2s && h < e2e) return true;
       return false;
